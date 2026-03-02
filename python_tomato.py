@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-AgroPick simple web controller.
+AgroPick tomato web controller.
 
 Architecture:
-  - Raspberry Pi owns camera, Gemini calls, web UI, and mode logic.
+  - Raspberry Pi owns camera, YOLO calls, web UI, and mode logic.
   - ESP32 is a simple serial actuator for rover + arm.
   - If ESP32 is missing, the app still runs in mock mode for vision/UI testing.
 """
@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import threading
 import time
 from dataclasses import asdict, dataclass, fields
@@ -22,10 +21,7 @@ import cv2
 import numpy as np
 import serial
 import serial.tools.list_ports
-from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, render_template_string, request
-from google import genai
-from google.genai import types
 from picamera2 import Picamera2
 
 try:
@@ -35,11 +31,19 @@ try:
 except ImportError:
     HAS_AF = False
 
+try:
+    from ultralytics import YOLO
 
-load_dotenv()
+    HAS_YOLO = True
+except ImportError:
+    YOLO = None
+    HAS_YOLO = False
 
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
-CONFIG_FILE = "agropick_config.json"
+
+CONFIG_FILE = "python_tomato_config.json"
+PICAMERA_OUTPUT_FORMAT = os.getenv("PICAMERA_OUTPUT_FORMAT", "RGB888")
+CAMERA_COLOR_ORDER = os.getenv("CAMERA_COLOR_ORDER", "BGR").upper()
+CAMERA_SWAP_RED_BLUE = os.getenv("CAMERA_SWAP_RED_BLUE", "false").lower() == "true"
 
 
 @dataclass
@@ -47,7 +51,7 @@ class Config:
     cam_w: int = 640
     cam_h: int = 480
     jpeg_quality: int = 70
-    detect_interval: float = 3.0
+    detect_interval: float = 0.8
     auto_pick_box_width_norm: int = 140
 
     esp_port: str = "/dev/ttyUSB0"
@@ -58,6 +62,12 @@ class Config:
     auto_rover_speed: int = 45
     auto_stop_settle: float = 0.5
     auto_resume_delay: float = 1.0
+
+    model_path: str = "/home/anjaly/Downloads/best.pt"
+    confidence_threshold: float = 0.4
+    min_detection_size: int = 50
+    tomato_diameter_ref: float = 6.0
+    focal_length: float = 1400.0
 
     base_min: int = 70
     base_max: int = 160
@@ -88,7 +98,7 @@ class Config:
     grab_h: float = 3.0
     lift_h: float = 10.0
 
-    port: int = 5000
+    port: int = 5001
 
     def save(self) -> None:
         with open(CONFIG_FILE, "w", encoding="utf-8") as handle:
@@ -113,11 +123,6 @@ class Config:
 
 cfg = Config.load()
 
-MODEL_NAME = "gemini-robotics-er-1.5-preview"
-PICAMERA_OUTPUT_FORMAT = os.getenv("PICAMERA_OUTPUT_FORMAT", "RGB888")
-CAMERA_COLOR_ORDER = os.getenv("CAMERA_COLOR_ORDER", "BGR").upper()
-CAMERA_SWAP_RED_BLUE = os.getenv("CAMERA_SWAP_RED_BLUE", "false").lower() == "true"
-
 
 class State:
     def __init__(self) -> None:
@@ -125,7 +130,7 @@ class State:
         self.mode = "manual"
         self.running = False
         self.esp_ok = False
-        self.gemini_ok = False
+        self.vision_ok = False
         self.rover_moving = False
         self.rover_dir = "stopped"
         self.arm_busy = False
@@ -150,6 +155,13 @@ def log(msg: str, lvl: str = "INFO") -> None:
         S.logs.append(entry)
         if len(S.logs) > 120:
             S.logs.pop(0)
+
+
+def clamp_norm(value: Any) -> int:
+    try:
+        return int(np.clip(int(value), 0, 1000))
+    except Exception:
+        return 0
 
 
 class SerialManager:
@@ -207,7 +219,13 @@ class SerialManager:
             return False
         return False
 
-    def _protocol_call(self, opcode: str, *parts: Any, expect_value: Optional[str] = None, timeout: float = 8.0) -> List[str]:
+    def _protocol_call(
+        self,
+        opcode: str,
+        *parts: Any,
+        expect_value: Optional[str] = None,
+        timeout: float = 8.0,
+    ) -> List[str]:
         if not self.connected or self.ser is None:
             log(f"[MOCK] -> {opcode}|{'|'.join(str(part) for part in parts)}", "INFO")
             return []
@@ -455,9 +473,7 @@ class ArmController:
 
     def close_gripper(self, diameter_cm: float = 5.0) -> None:
         angle_range = cfg.gripper_max - cfg.gripper_min
-        angle = cfg.gripper_min + int(
-            (1 - min(diameter_cm, 8.0) / 8.0) * angle_range
-        )
+        angle = cfg.gripper_min + int((1 - min(diameter_cm, 8.0) / 8.0) * angle_range)
         angle = int(np.clip(angle, cfg.gripper_min, cfg.gripper_max))
         self._set_busy(True)
         try:
@@ -502,9 +518,7 @@ class ArmController:
 
             log("Step 4/6: Grip", "ARM")
             angle_range = cfg.gripper_max - cfg.gripper_min
-            grip_angle = cfg.gripper_min + int(
-                (1 - min(diameter_cm, 8.0) / 8.0) * angle_range
-            )
+            grip_angle = cfg.gripper_min + int((1 - min(diameter_cm, 8.0) / 8.0) * angle_range)
             grip_angle = int(np.clip(grip_angle, cfg.gripper_min, cfg.gripper_max))
             self._send("gripper", grip_angle)
             time.sleep(0.5)
@@ -543,195 +557,108 @@ class ArmController:
 arm = ArmController()
 
 
-DETECT_PROMPT = """
-You are controlling a robot arm for agricultural harvesting.
-Analyze this image and detect any visible fruits or vegetables that could be
-picked.
-
-Return ONLY a JSON object, with no explanation and no markdown:
-{
-  "detections": [
-    {
-      "label": "tomato",
-      "pick_point": [y, x],
-      "box_2d": [ymin, xmin, ymax, xmax],
-      "estimated_diameter_cm": 5.0,
-      "is_ripe": true
-    }
-  ],
-  "scene_description": "brief one line description",
-  "recommended_target": "label of best fruit or vegetable to pick, or null"
-}
-
-Rules:
-- Include fruits and vegetables such as tomato, brinjal, eggplant, okra,
-  cucumber, chili, capsicum, pepper, bean, carrot, onion, potato, banana,
-  apple, mango, orange, and similar produce when visible.
-- Use normalized coordinates from 0 to 1000.
-- If nothing suitable is visible, return an empty detections list and null
-  recommended_target.
-- If ripeness is not relevant for a vegetable, set is_ripe to true when it
-  looks harvestable.
-""".strip()
-
-
-def parse_json_safe(text: str) -> Any:
-    cleaned = text.strip()
-    cleaned = re.sub(
-        r"^```(?:json)?\s*|\s*```$",
-        "",
-        cleaned,
-        flags=re.IGNORECASE | re.DOTALL,
-    ).strip()
-    candidates: List[str] = [cleaned]
-    object_match = re.search(r"\{[\s\S]*\}", cleaned)
-    array_match = re.search(r"\[[\s\S]*\]", cleaned)
-    if object_match:
-        candidates.append(object_match.group(0))
-    if array_match:
-        candidates.append(array_match.group(0))
-    for candidate in candidates:
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-    raise ValueError(f"No JSON in: {cleaned[:120]}")
-
-
-def normalize_detection_result(result: Any) -> Dict[str, Any]:
-    if isinstance(result, dict):
-        detections = result.get("detections", [])
-        if not isinstance(detections, list):
-            detections = []
-        recommended_target = result.get("recommended_target")
-        if recommended_target is not None and not isinstance(recommended_target, str):
-            recommended_target = None
-        scene_description = result.get("scene_description", "")
-        if not isinstance(scene_description, str):
-            scene_description = ""
-        return {
-            "detections": detections,
-            "scene_description": scene_description,
-            "recommended_target": recommended_target,
-        }
-    if isinstance(result, list):
-        detections = [item for item in result if isinstance(item, dict)]
-        target = detections[0].get("label") if detections else None
-        return {
-            "detections": detections,
-            "scene_description": "",
-            "recommended_target": target if isinstance(target, str) else None,
-        }
-    raise ValueError(f"Unexpected Gemini payload type: {type(result).__name__}")
-
-
-def clamp_norm(value: Any) -> int:
-    try:
-        return int(np.clip(int(value), 0, 1000))
-    except Exception:
-        return 0
-
-
-class GeminiController:
+class TomatoVisionController:
     def __init__(self) -> None:
-        self.client: Optional[genai.Client] = None
-        self.model = MODEL_NAME
+        self.model: Any = None
 
     def init(self) -> bool:
-        if not GOOGLE_API_KEY:
-            log("No GOOGLE_API_KEY in .env", "WARN")
+        if not HAS_YOLO:
+            with S.lock:
+                S.vision_ok = False
+            log("ultralytics is not installed", "ERROR")
             return False
         try:
-            self.client = genai.Client(api_key=GOOGLE_API_KEY)
-            test = self.client.models.generate_content(model=self.model, contents="ping")
+            self.model = YOLO(cfg.model_path)
             with S.lock:
-                S.gemini_ok = True
-            log(f"Gemini OK: {(test.text or '')[:40]}", "SUCCESS")
+                S.vision_ok = True
+            log(f"YOLO ready: {cfg.model_path}", "SUCCESS")
             return True
         except Exception as exc:
             with S.lock:
-                S.gemini_ok = False
-            log(f"Gemini failed: {exc}", "ERROR")
+                S.vision_ok = False
+            log(f"YOLO failed: {exc}", "ERROR")
             return False
 
-    def _call(self, image_bytes: bytes, prompt: str) -> str:
-        if self.client is None:
-            raise RuntimeError("Gemini client not initialized")
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=[
-                types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
-                prompt,
-            ],
-            config=types.GenerateContentConfig(
-                temperature=0.3,
-                thinking_config=types.ThinkingConfig(thinking_budget=0),
-                response_mime_type="application/json",
-            ),
-        )
-        return (response.text or "").strip()
-
-    def _norm_to_cm(self, x_norm: float, y_norm: float) -> Tuple[float, float]:
-        x_cm = 5 + (x_norm / 1000.0) * 25
-        y_cm = ((y_norm - 500) / 500.0) * 15
+    def _pixel_to_robot(self, center_x: int, center_y: int, frame_w: int, frame_h: int) -> Tuple[float, float]:
+        x_norm = center_x / max(frame_w, 1)
+        y_norm = center_y / max(frame_h, 1)
+        x_cm = 5 + x_norm * 25
+        y_cm = (y_norm - 0.5) * 15
         return x_cm, y_cm
 
-    def detect(self, image_bytes: bytes) -> Tuple[List[Dict[str, Any]], str]:
-        if self.client is None:
+    def detect(self, frame: np.ndarray) -> Tuple[List[Dict[str, Any]], str]:
+        if self.model is None:
             return [], ""
-        raw_result = parse_json_safe(self._call(image_bytes, DETECT_PROMPT))
-        result = normalize_detection_result(raw_result)
+
+        results = self.model(frame, conf=cfg.confidence_threshold, verbose=False)
+        frame_h, frame_w = frame.shape[:2]
         detections: List[Dict[str, Any]] = []
-        target = result["recommended_target"]
 
-        for item in result["detections"]:
-            if not isinstance(item, dict):
-                continue
-            label = str(item.get("label", "?"))
-            is_ripe = bool(item.get("is_ripe", True))
-            diameter = float(item.get("estimated_diameter_cm", 5.0) or 5.0)
-            box = item.get("box_2d")
-            point = item.get("pick_point", [500, 500])
-            if not isinstance(point, list) or len(point) != 2:
-                point = [500, 500]
-            y_norm = clamp_norm(point[0])
-            x_norm = clamp_norm(point[1])
-            x_cm, y_cm = self._norm_to_cm(x_norm, y_norm)
+        for result in results:
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                names = self.model.names
+                label = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else str(names[cls_id])
+                label = str(label)
+                conf = float(box.conf[0])
 
-            width_norm = 0
-            if isinstance(box, list) and len(box) == 4:
-                ymin, xmin, ymax, xmax = [clamp_norm(v) for v in box]
-                box = [ymin, xmin, ymax, xmax]
-                width_norm = abs(xmax - xmin)
-            else:
-                box = None
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                width = x2 - x1
+                height = y2 - y1
+                if width < cfg.min_detection_size:
+                    continue
 
-            detections.append(
-                {
-                    "label": label,
-                    "is_ripe": is_ripe,
-                    "diameter_cm": diameter,
-                    "can_grip": diameter <= 8.0,
-                    "box_norm": box,
-                    "pick_norm": [y_norm, x_norm],
-                    "width_norm": width_norm,
-                    "robot_coords": (x_cm, y_cm),
-                    "is_target": label == target,
-                }
-            )
+                center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+                pixel_size = (width + height) / 2.0
+                if width > 0:
+                    distance = (cfg.tomato_diameter_ref * cfg.focal_length) / width
+                    diameter = (pixel_size * distance) / cfg.focal_length
+                else:
+                    diameter = cfg.tomato_diameter_ref
+
+                x_cm, y_cm = self._pixel_to_robot(center_x, center_y, frame_w, frame_h)
+                is_ripe = label.lower() == "ripe"
+
+                detections.append(
+                    {
+                        "label": label,
+                        "confidence": conf,
+                        "is_ripe": is_ripe,
+                        "diameter_cm": float(diameter),
+                        "can_grip": float(diameter) <= 8.0,
+                        "box_norm": [
+                            int(np.clip(y1 / frame_h * 1000, 0, 1000)),
+                            int(np.clip(x1 / frame_w * 1000, 0, 1000)),
+                            int(np.clip(y2 / frame_h * 1000, 0, 1000)),
+                            int(np.clip(x2 / frame_w * 1000, 0, 1000)),
+                        ],
+                        "pick_norm": [
+                            int(np.clip(center_y / frame_h * 1000, 0, 1000)),
+                            int(np.clip(center_x / frame_w * 1000, 0, 1000)),
+                        ],
+                        "width_norm": int(np.clip(width / frame_w * 1000, 0, 1000)),
+                        "robot_coords": (x_cm, y_cm),
+                        "is_target": is_ripe,
+                    }
+                )
 
         detections.sort(
             key=lambda item: (
                 not item["is_target"],
-                not item["is_ripe"],
                 not item["can_grip"],
+                -item["confidence"],
                 -item["width_norm"],
             )
         )
-        return detections, result["scene_description"]
+
+        ripe_count = sum(1 for item in detections if item["is_ripe"])
+        unripe_count = max(0, len(detections) - ripe_count)
+        scene_desc = f"{ripe_count} ripe, {unripe_count} unripe"
+        return detections, scene_desc
 
 
-gemini = GeminiController()
+vision = TomatoVisionController()
 
 
 class PiCamera:
@@ -793,11 +720,7 @@ class PiCamera:
         return frame
 
     def frame_to_jpeg(self, frame: np.ndarray) -> bytes:
-        ok, buffer = cv2.imencode(
-            ".jpg",
-            frame,
-            [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality],
-        )
+        ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, cfg.jpeg_quality])
         if not ok:
             raise RuntimeError("Failed to encode JPEG")
         return buffer.tobytes()
@@ -828,16 +751,16 @@ def best_pickable_detection() -> Optional[Dict[str, Any]]:
 
 
 def trigger_detect(frame: np.ndarray) -> None:
-    if not S.gemini_ok or arm.busy:
+    if not S.vision_ok or arm.busy:
         return
     try:
-        detections, scene_desc = gemini.detect(camera.frame_to_jpeg(frame))
+        detections, scene_desc = vision.detect(frame)
         update_detection_state(detections, scene_desc)
         if detections:
             ripe_count = sum(1 for item in detections if item["is_ripe"])
-            log(f"Detected {len(detections)} items ({ripe_count} ripe)", "GEMINI")
+            log(f"Detected {len(detections)} tomatoes ({ripe_count} ripe)", "VISION")
         else:
-            log("No harvestable produce visible", "GEMINI")
+            log("No tomatoes visible", "VISION")
     except Exception as exc:
         log(f"Detection failed: {exc}", "ERROR")
 
@@ -858,7 +781,7 @@ def draw_overlay(frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndar
             if not det["can_grip"]:
                 color = (0, 100, 255)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            text = f"{det['label']} {det['diameter_cm']:.1f}cm"
+            text = f"{det['label']} {det['confidence']:.2f}"
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
             cv2.rectangle(out, (x1, max(0, y1 - th - 8)), (x1 + tw + 4, y1), color, -1)
             cv2.putText(
@@ -923,7 +846,7 @@ def control_loop() -> None:
         with S.lock:
             should_detect = (
                 S.running
-                and S.gemini_ok
+                and S.vision_ok
                 and not S.arm_busy
                 and (now - last_detect) >= cfg.detect_interval
             )
@@ -973,7 +896,7 @@ HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>AgroPick</title>
+<title>AgroPick Tomato</title>
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
@@ -1051,10 +974,10 @@ input[type=range]::-webkit-slider-thumb{
 </head>
 <body>
 <div class="header">
-  <div class="logo">AGROPICK</div>
+  <div class="logo">AGROPICK TOMATO</div>
   <div class="header-status">
     <span><span class="dot" id="espDot"></span>ESP32</span>
-    <span><span class="dot" id="gemDot"></span>Gemini</span>
+    <span><span class="dot" id="visionDot"></span>Vision</span>
     <span id="modeLabel">MANUAL</span>
   </div>
 </div>
@@ -1102,7 +1025,7 @@ input[type=range]::-webkit-slider-thumb{
         <div class="stat"><div class="stat-val" id="sOk">0</div><div class="stat-lbl">Picked</div></div>
         <div class="stat"><div class="stat-val" id="sTry">0</div><div class="stat-lbl">Attempts</div></div>
         <div class="stat"><div class="stat-val" id="sRipe">0</div><div class="stat-lbl">Ripe</div></div>
-        <div class="stat"><div class="stat-val" id="sUnripe">0</div><div class="stat-lbl">Other</div></div>
+        <div class="stat"><div class="stat-val" id="sUnripe">0</div><div class="stat-lbl">Unripe</div></div>
       </div>
     </div>
     <div class="card" style="margin-top:12px">
@@ -1169,7 +1092,7 @@ function saveIK(){
 function poll(){
   api('status').then(d=>{
     document.getElementById('espDot').className='dot'+(d.esp_ok?' on':'');
-    document.getElementById('gemDot').className='dot'+(d.gemini_ok?' on':'');
+    document.getElementById('visionDot').className='dot'+(d.vision_ok?' on':'');
     document.getElementById('sOk').textContent=d.picks_ok;
     document.getElementById('sTry').textContent=d.picks_try;
     document.getElementById('sRipe').textContent=d.ripe_count;
@@ -1229,7 +1152,7 @@ def api_status() -> Response:
                 "mode": S.mode,
                 "running": S.running,
                 "esp_ok": S.esp_ok,
-                "gemini_ok": S.gemini_ok,
+                "vision_ok": S.vision_ok,
                 "rover_moving": S.rover_moving,
                 "rover_dir": S.rover_dir,
                 "arm_busy": S.arm_busy,
@@ -1307,7 +1230,7 @@ def api_ik() -> Response:
 
 @app.route("/api/scan", methods=["GET", "POST"])
 def api_scan() -> Response:
-    if not camera.ok or not S.gemini_ok or arm.busy:
+    if not camera.ok or not S.vision_ok or arm.busy:
         return jsonify({"ok": False})
 
     def worker() -> None:
@@ -1370,12 +1293,12 @@ def api_arm_pick() -> Response:
 
 
 def main() -> None:
-    log("AgroPick starting", "INFO")
+    log("AgroPick tomato starting", "INFO")
     serial_mgr.connect()
     if not camera.start():
         log("Camera required - exiting", "ERROR")
         return
-    gemini.init()
+    vision.init()
     if serial_mgr.connected:
         arm.home()
     else:
