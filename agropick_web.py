@@ -11,6 +11,7 @@ import os
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from typing import Any, Optional
 
@@ -92,6 +93,8 @@ class Config:
     grab_height_cm: float = 3.0
     lift_height_cm: float = 10.0
     gripper_max_capacity_cm: float = 8.0
+    use_firmware_home_command: bool = True
+    home_command_timeout_seconds: float = 8.0
 
     web_port: int = 5000
 
@@ -153,6 +156,11 @@ def log(message: str, level: str = "INFO") -> None:
 class SerialManager:
     def __init__(self) -> None:
         self.serial: Optional[serial.Serial] = None
+        self._write_lock = threading.Lock()
+        self._line_condition = threading.Condition()
+        self._recent_lines: deque[tuple[float, str]] = deque(maxlen=200)
+        self._reader_thread: Optional[threading.Thread] = None
+        self._reader_running = False
 
     def find_esp32(self) -> Optional[str]:
         for port in serial.tools.list_ports.comports():
@@ -176,13 +184,11 @@ class SerialManager:
 
         try:
             log(f"Connecting to ESP32 on {port}", "INFO")
-            self.serial = serial.Serial(port, config.esp32_baudrate, timeout=1)
+            self.serial = serial.Serial(port, config.esp32_baudrate, timeout=0.2)
             time.sleep(2)
-
-            while self.serial.in_waiting:
-                line = self.serial.readline().decode("utf-8", errors="ignore").strip()
-                if line:
-                    log(f"ESP32: {line}", "INFO")
+            self.serial.reset_input_buffer()
+            self.serial.reset_output_buffer()
+            self._start_reader()
 
             with state.lock:
                 state.esp32_connected = True
@@ -194,11 +200,42 @@ class SerialManager:
             log(f"ESP32 connection failed: {exc}", "WARN")
             return False
 
+    def _start_reader(self) -> None:
+        if self._reader_thread and self._reader_thread.is_alive():
+            return
+        self._reader_running = True
+        self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self._reader_thread.start()
+
+    def _reader_loop(self) -> None:
+        while self._reader_running:
+            if self.serial is None:
+                time.sleep(0.1)
+                continue
+            try:
+                raw = self.serial.readline()
+            except Exception as exc:
+                with state.lock:
+                    state.esp32_connected = False
+                log(f"Serial read failed: {exc}", "ERROR")
+                return
+            if not raw:
+                continue
+            line = raw.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            with self._line_condition:
+                self._recent_lines.append((time.time(), line))
+                self._line_condition.notify_all()
+            log(f"ESP32: {line}", "INFO")
+
     def send(self, command: str) -> bool:
         if not self.serial:
             return False
         try:
-            self.serial.write(f"{command}\n".encode())
+            with self._write_lock:
+                self.serial.write(f"{command}\n".encode())
+                self.serial.flush()
             time.sleep(0.02)
             return True
         except Exception as exc:
@@ -206,6 +243,21 @@ class SerialManager:
                 state.esp32_connected = False
             log(f"Serial send failed: {exc}", "ERROR")
             return False
+
+    def wait_for_line_contains(self, needle: str, timeout: float, since: float) -> bool:
+        deadline = time.time() + timeout
+        target = needle.lower()
+        with self._line_condition:
+            while True:
+                if any(
+                    timestamp >= since and target in line.lower()
+                    for timestamp, line in self._recent_lines
+                ):
+                    return True
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return False
+                self._line_condition.wait(timeout=remaining)
 
 
 serial_mgr = SerialManager()
@@ -232,10 +284,10 @@ class RoverController:
             log(f"Rover -> {direction} ({speed})", "ROVER")
 
     def forward(self, speed: Optional[int] = None) -> None:
-        self._send_motion("b", "forward", speed or config.rover_speed)
+        self._send_motion("f", "forward", speed or config.rover_speed)
 
     def backward(self, speed: Optional[int] = None) -> None:
-        self._send_motion("f", "backward", speed or config.rover_speed)
+        self._send_motion("b", "backward", speed or config.rover_speed)
 
     def left(self, speed: Optional[int] = None) -> None:
         self._send_motion("l", "left", speed or config.rover_turn_speed)
@@ -265,6 +317,17 @@ class ArmController:
     def _set_busy(self, busy: bool) -> None:
         with state.lock:
             state.arm_busy = busy
+
+    def _sync_home_state(self) -> None:
+        self._positions = {
+            "base": config.home_base,
+            "shoulder": config.home_shoulder,
+            "wrist": config.home_wrist,
+            "gripper": config.home_gripper,
+            "rotgripper": config.home_rotgripper,
+        }
+        with state.lock:
+            state.arm_positions = self._positions.copy()
 
     def _send(self, servo: str, angle: int) -> bool:
         limits = {
@@ -317,6 +380,18 @@ class ArmController:
             self._set_busy(True)
         try:
             log("Arm -> HOME", "ARM")
+            if config.use_firmware_home_command:
+                started_at = time.time()
+                if serial_mgr.send("home"):
+                    if serial_mgr.wait_for_line_contains(
+                        "HOME complete",
+                        timeout=config.home_command_timeout_seconds,
+                        since=started_at,
+                    ):
+                        self._sync_home_state()
+                        log("Arm home complete", "SUCCESS")
+                        return
+                    log("Firmware home timed out, falling back to direct servo commands", "WARN")
             self._send("gripper", config.home_gripper)
             time.sleep(0.3)
             self._send("wrist", config.home_wrist)
@@ -327,6 +402,7 @@ class ArmController:
             time.sleep(0.3)
             self._send("rotgripper", config.home_rotgripper)
             time.sleep(0.3)
+            self._sync_home_state()
             log("Arm home complete", "SUCCESS")
         finally:
             if not preserve_busy:
