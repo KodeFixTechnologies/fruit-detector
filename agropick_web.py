@@ -157,6 +157,92 @@ class SerialManager:
         self.ser: Optional[serial.Serial] = None
         self.connected = False
         self._lock = threading.Lock()
+        self._next_command_id = 1
+
+    def _command_id(self) -> str:
+        command_id = str(self._next_command_id)
+        self._next_command_id += 1
+        return command_id
+
+    def _readline(self, timeout: float = 0.25) -> str:
+        if self.ser is None:
+            return ""
+        original_timeout = self.ser.timeout
+        try:
+            self.ser.timeout = timeout
+            raw = self.ser.readline()
+        finally:
+            self.ser.timeout = original_timeout
+        return raw.decode("utf-8", errors="ignore").strip() if raw else ""
+
+    def _flush_input(self) -> None:
+        if self.ser is None:
+            return
+        try:
+            self.ser.reset_input_buffer()
+        except Exception:
+            pass
+
+    def _probe_protocol(self) -> bool:
+        if self.ser is None:
+            return False
+        command_id = "probe"
+        try:
+            with self._lock:
+                self._flush_input()
+                self.ser.write(f"GET|{command_id}|VERSION\n".encode())
+                self.ser.flush()
+                deadline = time.time() + 1.0
+                while time.time() < deadline:
+                    line = self._readline(0.15)
+                    if not line:
+                        continue
+                    if line == f"ACK|{command_id}":
+                        continue
+                    if line.startswith(f"VAL|{command_id}|VERSION|"):
+                        return True
+                    if line.startswith(f"ERR|{command_id}|"):
+                        return False
+        except Exception:
+            return False
+        return False
+
+    def _protocol_call(self, opcode: str, *parts: Any, expect_value: Optional[str] = None, timeout: float = 8.0) -> List[str]:
+        if not self.connected or self.ser is None:
+            log(f"[MOCK] -> {opcode}|{'|'.join(str(part) for part in parts)}", "INFO")
+            return []
+
+        command_id = self._command_id()
+        frame = "|".join([opcode, command_id] + [str(part) for part in parts if part is not None])
+
+        with self._lock:
+            self._flush_input()
+            self.ser.write(f"{frame}\n".encode())
+            self.ser.flush()
+
+            deadline = time.time() + timeout
+            saw_ack = False
+            while time.time() < deadline:
+                line = self._readline(0.15)
+                if not line:
+                    continue
+                if line == f"ACK|{command_id}":
+                    saw_ack = True
+                    if expect_value is None and opcode == "PING":
+                        return []
+                    continue
+                if line.startswith(f"ERR|{command_id}|"):
+                    raise RuntimeError(line)
+                if line.startswith(f"VAL|{command_id}|"):
+                    tokens = line.split("|")
+                    if expect_value is None or (len(tokens) >= 3 and tokens[2] == expect_value):
+                        return tokens[3:]
+                if line.startswith(f"DONE|{command_id}|"):
+                    return line.split("|")[2:]
+
+            if not saw_ack:
+                raise TimeoutError(f"Protocol ACK timeout for {frame}")
+            raise TimeoutError(f"Protocol completion timeout for {frame}")
 
     def _find_port(self) -> Optional[str]:
         if os.path.exists(cfg.esp_port):
@@ -179,14 +265,28 @@ class SerialManager:
         try:
             self.ser = serial.Serial(port, cfg.esp_baud, timeout=1)
             time.sleep(2)
+            firmware_ready = False
             while self.ser.in_waiting:
                 line = self.ser.readline().decode("utf-8", errors="ignore").strip()
                 if line:
                     log(f"ESP32: {line}")
+                    if line.startswith("READY|actuator-v1"):
+                        firmware_ready = True
+            if not firmware_ready:
+                firmware_ready = self._probe_protocol()
+            if not firmware_ready:
+                if self.ser is not None:
+                    self.ser.close()
+                self.ser = None
+                self.connected = False
+                with S.lock:
+                    S.esp_ok = False
+                log("ESP32 firmware is not agropick_unified_optimized.ino - MOCK mode", "WARN")
+                return False
             self.connected = True
             with S.lock:
                 S.esp_ok = True
-            log(f"ESP32 connected on {port}", "SUCCESS")
+            log(f"ESP32 connected on {port} (optimized protocol)", "SUCCESS")
             return True
         except Exception as exc:
             log(f"ESP32 failed: {exc} - MOCK mode", "WARN")
@@ -196,20 +296,23 @@ class SerialManager:
                 S.esp_ok = False
             return False
 
-    def send(self, cmd: str) -> None:
-        if not self.connected or self.ser is None:
-            log(f"[MOCK] -> {cmd}", "INFO")
-            return
-        with self._lock:
-            try:
-                self.ser.write(f"{cmd}\n".encode())
-                self.ser.flush()
-                time.sleep(0.02)
-            except Exception as exc:
-                log(f"Serial error: {exc}", "ERROR")
-                self.connected = False
-                with S.lock:
-                    S.esp_ok = False
+    def rover(self, direction: str, speed: Optional[int] = None) -> None:
+        if direction == "STOP":
+            self._protocol_call("ROVER", "STOP", timeout=2.0)
+        else:
+            self._protocol_call("ROVER", direction, int(speed or 0), timeout=2.0)
+
+    def pose(self, base: int, shoulder: int, wrist: int) -> None:
+        self._protocol_call("POSE", int(base), int(shoulder), int(wrist), timeout=8.0)
+
+    def gripper(self, angle: int) -> None:
+        self._protocol_call("GRIPPER", int(angle), timeout=5.0)
+
+    def rotgripper(self, angle: int) -> None:
+        self._protocol_call("ROTGRIPPER", int(angle), timeout=5.0)
+
+    def home(self) -> None:
+        self._protocol_call("HOME", timeout=12.0)
 
 
 serial_mgr = SerialManager()
@@ -222,23 +325,23 @@ class RoverController:
             S.rover_moving = moving
 
     def forward(self, speed: int = 0) -> None:
-        serial_mgr.send(f"b{speed or cfg.rover_speed}")
+        serial_mgr.rover("FWD", speed or cfg.rover_speed)
         self._set_state("forward", True)
 
     def backward(self, speed: int = 0) -> None:
-        serial_mgr.send(f"f{speed or cfg.rover_speed}")
+        serial_mgr.rover("REV", speed or cfg.rover_speed)
         self._set_state("backward", True)
 
     def left(self, speed: int = 0) -> None:
-        serial_mgr.send(f"l{speed or cfg.rover_turn_speed}")
+        serial_mgr.rover("LEFT", speed or cfg.rover_turn_speed)
         self._set_state("left", True)
 
     def right(self, speed: int = 0) -> None:
-        serial_mgr.send(f"r{speed or cfg.rover_turn_speed}")
+        serial_mgr.rover("RIGHT", speed or cfg.rover_turn_speed)
         self._set_state("right", True)
 
     def stop(self) -> None:
-        serial_mgr.send("s")
+        serial_mgr.rover("STOP")
         self._set_state("stopped", False)
 
 
@@ -274,7 +377,20 @@ class ArmController:
         if servo in limits:
             lo, hi = limits[servo]
             angle = int(np.clip(angle, lo, hi))
-        serial_mgr.send(f"{servo}:{angle}")
+        if servo in ("base", "shoulder", "wrist"):
+            pose = {
+                "base": self.positions["base"],
+                "shoulder": self.positions["shoulder"],
+                "wrist": self.positions["wrist"],
+            }
+            pose[servo] = angle
+            serial_mgr.pose(pose["base"], pose["shoulder"], pose["wrist"])
+        elif servo == "gripper":
+            serial_mgr.gripper(angle)
+        elif servo == "rotgripper":
+            serial_mgr.rotgripper(angle)
+        else:
+            raise RuntimeError(f"Unknown servo: {servo}")
         self.positions[servo] = angle
         with S.lock:
             S.arm_pos = self.positions.copy()
@@ -300,26 +416,30 @@ class ArmController:
             f"IK ({x:.1f},{y:.1f},{z:.1f}) -> base:{angles['base']} shoulder:{angles['shoulder']}",
             "ARM",
         )
-        self._send("base", angles["base"])
-        time.sleep(cfg.servo_delay)
-        self._send("shoulder", angles["shoulder"])
-        time.sleep(cfg.servo_delay)
-        self._send("wrist", cfg.wrist_fixed)
+        serial_mgr.pose(angles["base"], angles["shoulder"], cfg.wrist_fixed)
+        self.positions.update(
+            base=angles["base"],
+            shoulder=angles["shoulder"],
+            wrist=cfg.wrist_fixed,
+        )
+        with S.lock:
+            S.arm_pos = self.positions.copy()
         time.sleep(cfg.servo_delay)
 
     def home(self) -> None:
         self._set_busy(True)
         try:
             log("Moving to HOME", "ARM")
-            for servo, angle in {
+            serial_mgr.home()
+            self.positions = {
                 "base": cfg.home_base,
-                "shoulder": cfg.home_shoulder,
+                "shoulder": max(cfg.home_shoulder, 150),
                 "wrist": cfg.home_wrist,
                 "gripper": cfg.home_gripper,
                 "rotgripper": cfg.home_rotgrip,
-            }.items():
-                self._send(servo, angle)
-                time.sleep(0.3)
+            }
+            with S.lock:
+                S.arm_pos = self.positions.copy()
             log("HOME complete", "SUCCESS")
         finally:
             self._set_busy(False)
