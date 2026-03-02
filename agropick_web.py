@@ -9,7 +9,6 @@ Architecture:
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import json
 import os
@@ -43,7 +42,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 CONFIG_FILE = "agropick_web_config.json"
 CALIBRATION_FILE = "calibration.json"
 SUPPORTED_MODES = {"manual", "semi-auto", "autonomous"}
-LIVE_ACTIONS = {"continue_forward", "stop_and_confirm", "hold"}
+DECISION_ACTIONS = {"continue_forward", "stop_and_confirm", "hold"}
 
 
 @dataclass
@@ -53,11 +52,8 @@ class Config:
     stream_quality: int = 60
     control_loop_delay_seconds: float = 0.08
     model_input_max_dim: int = 448
-    live_frame_interval_seconds: float = 0.2
-    live_query_interval_seconds: float = 0.9
-    live_reconnect_seconds: float = 2.0
-    snapshot_fallback_interval_seconds: float = 1.5
-    live_stale_timeout_seconds: float = 3.0
+    snapshot_interval_seconds: float = 1.0
+    vision_stale_timeout_seconds: float = 3.0
     pi_camera_output_format: str = "RGB888"
     camera_color_order: str = "BGR"
     camera_swap_red_blue: bool = False
@@ -66,8 +62,7 @@ class Config:
     flip_vertical: bool = False
     roi_norm: list[int] = field(default_factory=lambda: [0, 0, 1000, 1000])
 
-    live_model_name: str = "gemini-2.5-flash-native-audio-preview-12-2025"
-    snapshot_model_name: str = "gemini-2.5-flash"
+    snapshot_model_name: str = "gemini-robotics-er-1.5-preview"
     confirm_model_name: str = "gemini-robotics-er-1.5-preview"
     confirm_fallback_model_name: str = "gemini-2.5-flash"
     genai_api_version: str = "v1alpha"
@@ -157,7 +152,7 @@ class DecisionTrace:
     selected_target: Optional[str] = None
     action: str = "hold"
     reason: str = "System idle"
-    live_latency_ms: Optional[int] = None
+    vision_latency_ms: Optional[int] = None
     confirm_latency_ms: Optional[int] = None
     stale: bool = True
     candidate_visible: bool = False
@@ -203,7 +198,7 @@ class AppState:
         self.system_running = False
         self.esp32_connected = False
         self.vision_connected = False
-        self.live_session_state = "disconnected"
+        self.vision_state = "idle"
         self.rover_moving = False
         self.rover_direction = "stopped"
         self.arm_busy = False
@@ -223,7 +218,7 @@ class AppState:
         self.serial_rtt_ms: Optional[int] = None
         self.last_confirm_latency_ms: Optional[int] = None
         self.fault_state: Optional[str] = None
-        self.last_raw_live = ""
+        self.last_raw_decision = ""
         self.last_raw_confirm = ""
         self.last_decision_at = 0.0
         self.candidate_signature: Optional[str] = None
@@ -1019,37 +1014,6 @@ class ArmController:
 arm = ArmController()
 
 
-LIVE_SYSTEM_INSTRUCTION = """
-You are AgroPick's live agricultural vision monitor.
-Watch the camera feed and return only compact JSON.
-
-Return only this JSON object:
-{
-  "scene_summary": "short scene summary",
-  "selected_target": "label or null",
-  "action": "continue_forward|stop_and_confirm|hold",
-  "reason": "short reason",
-  "candidate_visible": true,
-  "candidate": {
-    "label": "tomato",
-    "box_2d": [ymin, xmin, ymax, xmax],
-    "pick_point": [y, x],
-    "estimated_diameter_cm": 5.0,
-    "is_harvestable": true,
-    "reachable": true
-  }
-}
-
-Rules:
-- Detect fruits and vegetables only.
-- Coordinates are normalized 0 to 1000.
-- candidate may be null if nothing useful is visible.
-- If unsure, use action "hold".
-- Never return markdown fences.
-""".strip()
-
-LIVE_QUERY_PROMPT = "Return the current AgroPick JSON for the latest camera view only."
-
 SNAPSHOT_DECISION_PROMPT = """
 Analyze this agricultural camera image and return only JSON:
 {
@@ -1110,9 +1074,10 @@ def update_detection_state(detections: list[Detection], trace: DecisionTrace, ra
         state.ripe_count = sum(1 for item in detections if item.is_harvestable)
         state.unripe_count = max(0, len(detections) - state.ripe_count)
         state.vision_connected = True
+        state.vision_state = "robotics_snapshot"
         state.last_decision_at = time.time()
-        if source == "live":
-            state.last_raw_live = raw_text
+        if source == "decision":
+            state.last_raw_decision = raw_text
         else:
             state.last_raw_confirm = raw_text
 
@@ -1132,7 +1097,7 @@ def build_decision_from_payload(
         selected_target = None
 
     action = payload.get("action", "hold")
-    if action not in LIVE_ACTIONS:
+    if action not in DECISION_ACTIONS:
         action = "hold"
 
     reason = payload.get("reason", "")
@@ -1163,7 +1128,7 @@ def build_decision_from_payload(
         selected_target=selected_target,
         action=action,
         reason=reason or "No explicit reason returned",
-        live_latency_ms=latency_ms if source != "confirm" else state.decision_trace.live_latency_ms,
+        vision_latency_ms=latency_ms if source != "confirm" else state.decision_trace.vision_latency_ms,
         confirm_latency_ms=latency_ms if source == "confirm" else state.last_confirm_latency_ms,
         stale=False,
         candidate_visible=candidate_visible or bool(detections),
@@ -1274,186 +1239,45 @@ class PiCamera:
 camera = PiCamera()
 
 
-class LiveDecisionEngine:
-    def __init__(self, apply_payload_callback) -> None:
-        self._apply_payload_callback = apply_payload_callback
-        self._stop_event = threading.Event()
-        self._restart_event = threading.Event()
-        self._frame_lock = threading.Lock()
-        self._latest_frame: Optional[bytes] = None
-        self._latest_frame_at = 0.0
-        self._thread = threading.Thread(target=self._run_thread, daemon=True)
-        self._last_query_sent_at = 0.0
-
-    def start(self) -> None:
-        if not self._thread.is_alive():
-            self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        self._restart_event.set()
-
-    def restart(self) -> None:
-        self._restart_event.set()
-
-    def submit_frame(self, frame_bytes: bytes) -> None:
-        with self._frame_lock:
-            self._latest_frame = frame_bytes
-            self._latest_frame_at = time.time()
-
-    def _pop_frame(self) -> Optional[bytes]:
-        with self._frame_lock:
-            frame = self._latest_frame
-            self._latest_frame = None
-            return frame
-
-    def _run_thread(self) -> None:
-        asyncio.run(self._supervisor())
-
-    async def _supervisor(self) -> None:
-        if not GOOGLE_API_KEY:
-            return
-
-        while not self._stop_event.is_set():
-            self._set_state("connecting", False)
-            try:
-                client = genai.Client(
-                    api_key=GOOGLE_API_KEY,
-                    http_options=types.HttpOptions(api_version=config.genai_api_version),
-                )
-                live_config = {
-                    "response_modalities": ["TEXT"],
-                    "system_instruction": LIVE_SYSTEM_INSTRUCTION,
-                }
-                async with client.aio.live.connect(model=config.live_model_name, config=live_config) as session:
-                    self._set_state("connected", True)
-                    receiver = asyncio.create_task(self._receive_loop(session))
-                    last_frame_sent = 0.0
-                    last_query_sent = 0.0
-
-                    while not self._stop_event.is_set() and not self._restart_event.is_set():
-                        frame = self._pop_frame()
-                        now = time.time()
-                        if frame is not None and now - last_frame_sent >= config.live_frame_interval_seconds:
-                            await session.send_realtime_input(
-                                video=types.Blob(data=frame, mime_type="image/jpeg")
-                            )
-                            last_frame_sent = now
-
-                        if now - last_query_sent >= config.live_query_interval_seconds:
-                            self._last_query_sent_at = now
-                            await session.send_client_content(
-                                turns=LIVE_QUERY_PROMPT,
-                                turn_complete=True,
-                            )
-                            last_query_sent = now
-
-                        await asyncio.sleep(0.05)
-
-                    self._restart_event.clear()
-                    receiver.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await receiver
-            except Exception as exc:
-                self._set_state("error", False)
-                log(f"Live vision unavailable: {exc}", "WARN")
-                await asyncio.sleep(config.live_reconnect_seconds)
-
-    def _set_state(self, session_state: str, connected: bool) -> None:
-        with state.lock:
-            state.live_session_state = session_state
-            if session_state != "fallback_snapshot":
-                state.vision_connected = connected
-
-    async def _receive_loop(self, session) -> None:
-        buffer = ""
-        async for message in session.receive():
-            text = self._extract_text(message)
-            if text:
-                buffer += text
-
-            if self._is_turn_complete(message):
-                if buffer.strip():
-                    latency_ms = int((time.time() - self._last_query_sent_at) * 1000) if self._last_query_sent_at else None
-                    self._apply_payload_callback(buffer, latency_ms, source="live")
-                buffer = ""
-
-    def _extract_text(self, message: Any) -> str:
-        chunks: list[str] = []
-        text = getattr(message, "text", None)
-        if isinstance(text, str) and text:
-            chunks.append(text)
-
-        server_content = getattr(message, "server_content", None)
-        if server_content is not None:
-            model_turn = getattr(server_content, "model_turn", None)
-            if model_turn is not None:
-                for part in getattr(model_turn, "parts", []) or []:
-                    part_text = getattr(part, "text", None)
-                    if isinstance(part_text, str) and part_text:
-                        chunks.append(part_text)
-        return "".join(chunks)
-
-    def _is_turn_complete(self, message: Any) -> bool:
-        if bool(getattr(message, "turn_complete", False)):
-            return True
-        server_content = getattr(message, "server_content", None)
-        if server_content is not None:
-            if bool(getattr(server_content, "turn_complete", False)):
-                return True
-            if bool(getattr(server_content, "generation_complete", False)):
-                return True
-        return False
-
-
 class VisionCoordinator:
     def __init__(self) -> None:
         self._snapshot_lock = threading.Lock()
         self._confirm_lock = threading.Lock()
         self._sync_client: Optional[genai.Client] = None
-        self.live_engine: Optional[LiveDecisionEngine] = None
         if GOOGLE_API_KEY:
             self._sync_client = genai.Client(
                 api_key=GOOGLE_API_KEY,
                 http_options=types.HttpOptions(api_version=config.genai_api_version),
             )
-            self.live_engine = LiveDecisionEngine(self.apply_live_text)
+            with state.lock:
+                state.vision_state = "robotics_snapshot"
+                state.vision_connected = True
 
     def start(self) -> None:
-        if self.live_engine is not None:
-            self.live_engine.start()
+        return None
 
     def restart(self) -> None:
-        if self.live_engine is not None:
-            self.live_engine.restart()
+        with state.lock:
+            state.vision_state = "robotics_snapshot" if self._sync_client is not None else "unavailable"
+            state.vision_connected = self._sync_client is not None
 
     def stop(self) -> None:
-        if self.live_engine is not None:
-            self.live_engine.stop()
+        return None
 
-    def apply_live_text(self, raw_text: str, latency_ms: Optional[int], source: str) -> None:
+    def apply_decision_text(self, raw_text: str, latency_ms: Optional[int], source: str) -> None:
         try:
             payload = parse_json_safe(raw_text)
             if not isinstance(payload, dict):
-                raise ValueError("Live payload was not a JSON object")
+                raise ValueError("Decision payload was not a JSON object")
             trace, detections = build_decision_from_payload(payload, raw_text, latency_ms, source)
             update_detection_state(detections, trace, raw_text, source)
         except Exception as exc:
             log(f"Vision JSON parse failed: {exc}", "WARN")
             with state.lock:
-                if source == "live":
-                    state.last_raw_live = raw_text
+                if source == "decision":
+                    state.last_raw_decision = raw_text
                 else:
                     state.last_raw_confirm = raw_text
-
-    def submit_live_frame(self, frame: np.ndarray) -> None:
-        if self.live_engine is None:
-            return
-        try:
-            frame_bytes, _ = camera.build_model_input(frame, use_roi=False)
-            self.live_engine.submit_frame(frame_bytes)
-        except Exception as exc:
-            log(f"Failed to prepare live frame: {exc}", "WARN")
 
     def snapshot_decision_async(self, frame: np.ndarray, force: bool = False) -> None:
         if self._sync_client is None:
@@ -1469,7 +1293,7 @@ class VisionCoordinator:
         def worker() -> None:
             try:
                 with state.lock:
-                    state.live_session_state = "fallback_snapshot"
+                    state.vision_state = "robotics_snapshot"
                 start = time.time()
                 image_bytes, _ = camera.build_model_input(frame, use_roi=False)
                 raw_text, _ = self._call_json_model(
@@ -1478,12 +1302,12 @@ class VisionCoordinator:
                     image_bytes,
                 )
                 latency_ms = int((time.time() - start) * 1000)
-                self.apply_live_text(raw_text, latency_ms, source="live")
+                self.apply_decision_text(raw_text, latency_ms, source="decision")
                 with state.lock:
-                    state.live_session_state = "fallback_snapshot"
+                    state.vision_state = "robotics_snapshot"
                     state.vision_connected = True
             except Exception as exc:
-                log(f"Snapshot fallback failed: {exc}", "WARN")
+                log(f"Snapshot decision failed: {exc}", "WARN")
             finally:
                 self._snapshot_lock.release()
 
@@ -1578,7 +1402,7 @@ class PickCoordinator:
                             selected_target=None,
                             action="hold",
                             reason=reason or "No reachable target confirmed",
-                            live_latency_ms=state.decision_trace.live_latency_ms,
+                            vision_latency_ms=state.decision_trace.vision_latency_ms,
                             confirm_latency_ms=state.last_confirm_latency_ms,
                             stale=False,
                             candidate_visible=False,
@@ -1609,7 +1433,7 @@ class PickCoordinator:
                             selected_target=None,
                             action="hold",
                             reason="Pick completed successfully",
-                            live_latency_ms=state.decision_trace.live_latency_ms,
+                            vision_latency_ms=state.decision_trace.vision_latency_ms,
                             confirm_latency_ms=state.last_confirm_latency_ms,
                             stale=False,
                             candidate_visible=False,
@@ -1694,7 +1518,7 @@ def overlay_detections(frame: np.ndarray) -> np.ndarray:
         top_line = (
             f"{mode.upper()} | Rover:{state.rover_direction.upper()} | "
             f"Arm:{'BUSY' if state.arm_busy else 'READY'} | "
-            f"Live:{state.live_session_state} | Picks:{state.picks_successful}/{state.picks_attempted}"
+            f"Vision:{state.vision_state} | Picks:{state.picks_successful}/{state.picks_attempted}"
         )
     cv2.putText(display, top_line, (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (245, 245, 245), 2)
     cv2.putText(
@@ -1759,10 +1583,11 @@ def maybe_mark_vision_stale() -> None:
             return
         if state.last_decision_at <= 0:
             return
-        if time.time() - state.last_decision_at <= config.live_stale_timeout_seconds:
+        if time.time() - state.last_decision_at <= config.vision_stale_timeout_seconds:
             return
         state.decision_trace.stale = True
         state.vision_connected = False
+        state.vision_state = "stale"
         if state.decision_trace.reason == "System idle":
             state.decision_trace.reason = "Vision output timed out"
 
@@ -1832,7 +1657,7 @@ def handle_mode_logic(best_detection: Optional[Detection]) -> None:
 
 def control_loop() -> None:
     log("Control loop started", "INFO")
-    last_fallback_snapshot = 0.0
+    last_snapshot_scan = 0.0
 
     while True:
         if camera.camera is None:
@@ -1846,22 +1671,16 @@ def control_loop() -> None:
             time.sleep(0.5)
             continue
 
-        with state.lock:
-            system_running = state.system_running
-
-        if system_running:
-            vision.submit_live_frame(frame)
         maybe_mark_vision_stale()
 
         with state.lock:
-            allow_fallback = (
+            allow_snapshot_scan = (
                 state.system_running
                 and not state.pick_inflight
                 and not state.arm_busy
-                and state.live_session_state != "connected"
             )
-        if allow_fallback and time.time() - last_fallback_snapshot >= config.snapshot_fallback_interval_seconds:
-            last_fallback_snapshot = time.time()
+        if allow_snapshot_scan and time.time() - last_snapshot_scan >= config.snapshot_interval_seconds:
+            last_snapshot_scan = time.time()
             vision.snapshot_decision_async(frame)
 
         best_detection = update_candidate_tracking()
@@ -2174,7 +1993,7 @@ HTML_TEMPLATE = """
           <div class="trace-item"><div class="label">Target</div><div class="value" id="selectedTarget">None</div></div>
           <div class="trace-item"><div class="label">Action</div><div class="value" id="actionValue">hold</div></div>
           <div class="trace-item"><div class="label">Reason</div><div class="value" id="reasonValue">System idle</div></div>
-          <div class="trace-item"><div class="label">Latency</div><div class="value" id="latencyValue">live: -, confirm: -, serial: -</div></div>
+          <div class="trace-item"><div class="label">Latency</div><div class="value" id="latencyValue">vision: -, confirm: -, serial: -</div></div>
           <div class="trace-item"><div class="label">Calibration</div><div class="value" id="calibrationValue">Not ready</div></div>
         </div>
 
@@ -2199,8 +2018,8 @@ HTML_TEMPLATE = """
 
         <details>
           <summary>Debug</summary>
-          <div class="section-title" style="margin-top:12px;">Raw Live Payload</div>
-          <pre id="rawLive"></pre>
+          <div class="section-title" style="margin-top:12px;">Raw Decision Payload</div>
+          <pre id="rawDecision"></pre>
           <div class="section-title" style="margin-top:12px;">Raw Confirm Payload</div>
           <pre id="rawConfirm"></pre>
           <div class="section-title" style="margin-top:12px;">Serial</div>
@@ -2316,7 +2135,7 @@ HTML_TEMPLATE = """
       api('status').then((data) => {
         running = data.system_running;
         document.getElementById('esp32Chip').textContent = 'ESP32: ' + (data.esp32_connected ? 'online' : 'offline');
-        document.getElementById('visionChip').textContent = 'Vision: ' + data.live_session_state;
+        document.getElementById('visionChip').textContent = 'Vision: ' + data.vision_state;
         document.getElementById('modeChip').textContent = 'Mode: ' + data.mode;
         document.getElementById('roverChip').textContent = 'Rover: ' + data.rover_direction;
         document.getElementById('armChip').textContent = 'Arm: ' + (data.arm_busy || data.pick_inflight ? 'busy' : 'ready');
@@ -2337,13 +2156,13 @@ HTML_TEMPLATE = """
         document.getElementById('actionValue').textContent = data.decision_trace.action + (data.decision_trace.stale ? ' (stale)' : '');
         document.getElementById('reasonValue').textContent = data.decision_trace.reason;
         document.getElementById('latencyValue').textContent =
-          'live: ' + (data.decision_trace.live_latency_ms ?? '-') + ' ms, ' +
+          'vision: ' + (data.decision_trace.vision_latency_ms ?? '-') + ' ms, ' +
           'confirm: ' + (data.last_confirm_latency_ms ?? '-') + ' ms, ' +
           'serial: ' + (data.serial_rtt_ms ?? '-') + ' ms';
         document.getElementById('calibrationValue').textContent =
           data.calibration.ready ? ('Ready (' + data.calibration.points.length + ' pts)') : 'Not ready';
 
-        document.getElementById('rawLive').textContent = data.last_raw_live || '(none)';
+        document.getElementById('rawDecision').textContent = data.last_raw_decision || '(none)';
         document.getElementById('rawConfirm').textContent = data.last_raw_confirm || '(none)';
         document.getElementById('serialDebug').textContent = (data.serial_debug_lines || []).join('\\n');
         document.getElementById('calibrationMatrix').textContent =
@@ -2433,7 +2252,7 @@ def api_status() -> Response:
             "system_running": state.system_running,
             "esp32_connected": state.esp32_connected,
             "vision_connected": state.vision_connected,
-            "live_session_state": state.live_session_state,
+            "vision_state": state.vision_state,
             "rover_moving": state.rover_moving,
             "rover_direction": state.rover_direction,
             "rover_speed": config.rover_speed,
@@ -2449,7 +2268,7 @@ def api_status() -> Response:
             "serial_rtt_ms": state.serial_rtt_ms,
             "last_confirm_latency_ms": state.last_confirm_latency_ms,
             "fault_state": state.fault_state,
-            "last_raw_live": state.last_raw_live,
+            "last_raw_decision": state.last_raw_decision,
             "last_raw_confirm": state.last_raw_confirm,
             "serial_debug_lines": list(state.serial_debug_lines),
             "logs": state.logs[-70:],
@@ -2547,7 +2366,7 @@ def api_scan() -> Response:
 def api_vision_restart() -> Response:
     vision.restart()
     with state.lock:
-        state.live_session_state = "restarting"
+        state.vision_state = "robotics_snapshot" if GOOGLE_API_KEY else "unavailable"
     return jsonify({"success": True})
 
 
@@ -2659,7 +2478,7 @@ def main() -> None:
         """
 +-----------------------------------------------------------------------+
 | AgroPick Low-Latency Controller                                       |
-| Pi: live vision, web UI, autonomy                                     |
+| Pi: robotics snapshot vision, web UI, autonomy                        |
 | ESP32: pure actuator over serial                                      |
 +-----------------------------------------------------------------------+
 """
