@@ -1,0 +1,585 @@
+#!/usr/bin/env python3
+"""
+Gemini Robotics fruit and vegetable webcam viewer.
+
+Features:
+  - Uses the laptop webcam through OpenCV.
+  - Runs periodic Gemini Robotics detection on the latest frame.
+  - Draws bounding boxes for visible fruits and vegetables.
+  - Shows scene context and detection summaries in a simple web UI.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import re
+import threading
+import time
+from typing import Any, Dict, List, Optional
+
+import cv2
+from dotenv import load_dotenv
+from flask import Flask, Response, jsonify, render_template_string, request
+from google import genai
+from google.genai import types
+
+
+load_dotenv()
+
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
+MODEL_NAME = "gemini-robotics-er-1.5-preview"
+CAMERA_INDEX = int(os.getenv("CAMERA_INDEX", "0"))
+FRAME_WIDTH = int(os.getenv("FRAME_WIDTH", "960"))
+FRAME_HEIGHT = int(os.getenv("FRAME_HEIGHT", "540"))
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "75"))
+PORT = int(os.getenv("PORT", "5050"))
+DETECT_INTERVAL = float(os.getenv("DETECT_INTERVAL", "2.0"))
+
+PROMPT = """
+You are analyzing a live farm or kitchen-style camera image.
+Detect only visible fruits or vegetables in the image.
+
+Return ONLY valid JSON with no markdown and no explanation:
+{
+  "scene_description": "one short sentence describing the scene",
+  "detections": [
+    {
+      "label": "tomato",
+      "box_2d": [ymin, xmin, ymax, xmax],
+      "state": "ripe/unripe/unknown",
+      "notes": "short phrase"
+    }
+  ]
+}
+
+Rules:
+- Include only fruits or vegetables.
+- box_2d values must be integers normalized from 0 to 1000.
+- If nothing relevant is visible, return an empty detections array.
+- Keep scene_description short.
+- Keep notes short.
+""".strip()
+
+
+def clamp(value: int, lower: int, upper: int) -> int:
+    return max(lower, min(value, upper))
+
+
+def strip_json_fences(text: str) -> str:
+    cleaned = text.strip()
+    return re.sub(
+        r"^```(?:json)?\s*|\s*```$",
+        "",
+        cleaned,
+        flags=re.IGNORECASE | re.DOTALL,
+    ).strip()
+
+
+def parse_detection_payload(text: str) -> Dict[str, Any]:
+    cleaned = strip_json_fences(text)
+    candidates: List[str] = [cleaned]
+    object_match = re.search(r"\{[\s\S]*\}", cleaned)
+    if object_match:
+        candidates.append(object_match.group(0))
+
+    payload: Optional[Dict[str, Any]] = None
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            payload = parsed
+            break
+
+    if payload is None:
+        raise ValueError("Gemini response did not contain a JSON object")
+
+    scene_description = payload.get("scene_description", "")
+    if not isinstance(scene_description, str):
+        scene_description = ""
+
+    detections: List[Dict[str, Any]] = []
+    raw_detections = payload.get("detections", [])
+    if isinstance(raw_detections, list):
+        for item in raw_detections:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label")
+            box = item.get("box_2d")
+            state = item.get("state", "unknown")
+            notes = item.get("notes", "")
+            if not isinstance(label, str):
+                continue
+            if not isinstance(box, list) or len(box) != 4:
+                continue
+            try:
+                ymin, xmin, ymax, xmax = [int(v) for v in box]
+            except (TypeError, ValueError):
+                continue
+            detections.append(
+                {
+                    "label": label.strip() or "unknown",
+                    "box_2d": [
+                        clamp(ymin, 0, 1000),
+                        clamp(xmin, 0, 1000),
+                        clamp(ymax, 0, 1000),
+                        clamp(xmax, 0, 1000),
+                    ],
+                    "state": state if isinstance(state, str) else "unknown",
+                    "notes": notes if isinstance(notes, str) else "",
+                }
+            )
+
+    return {"scene_description": scene_description, "detections": detections}
+
+
+def box_to_pixels(box: List[int], width: int, height: int) -> tuple[int, int, int, int]:
+    ymin, xmin, ymax, xmax = box
+    x1 = clamp(int(xmin / 1000.0 * width), 0, width - 1)
+    y1 = clamp(int(ymin / 1000.0 * height), 0, height - 1)
+    x2 = clamp(int(xmax / 1000.0 * width), 0, width - 1)
+    y2 = clamp(int(ymax / 1000.0 * height), 0, height - 1)
+    return x1, y1, x2, y2
+
+
+class AppState:
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.last_frame: Optional[Any] = None
+        self.last_jpeg: Optional[bytes] = None
+        self.detections: List[Dict[str, Any]] = []
+        self.scene_description = "Waiting for first scan"
+        self.logs: List[str] = []
+        self.status = "Starting..."
+        self.running = True
+        self.gemini_ok = False
+        self.camera_ok = False
+        self.last_scan_at = 0.0
+        self.request_in_flight = False
+
+
+S = AppState()
+
+
+def log(msg: str, level: str = "INFO") -> None:
+    entry = f"[{time.strftime('%H:%M:%S')}][{level}] {msg}"
+    print(entry, flush=True)
+    with S.lock:
+        S.logs.append(entry)
+        if len(S.logs) > 100:
+            S.logs.pop(0)
+
+
+class GeminiDetector:
+    def __init__(self) -> None:
+        self.client: Optional[genai.Client] = None
+
+    def init(self) -> bool:
+        if not GOOGLE_API_KEY:
+            log("No GOOGLE_API_KEY or GEMINI_API_KEY found", "ERROR")
+            return False
+        try:
+            self.client = genai.Client(api_key=GOOGLE_API_KEY)
+            response = self.client.models.generate_content(
+                model=MODEL_NAME,
+                contents="ping",
+            )
+            with S.lock:
+                S.gemini_ok = True
+            log(f"Gemini OK: {(response.text or '')[:40]}", "SUCCESS")
+            return True
+        except Exception as exc:
+            with S.lock:
+                S.gemini_ok = False
+            log(f"Gemini init failed: {exc}", "ERROR")
+            return False
+
+    def detect(self, jpeg_bytes: bytes) -> Dict[str, Any]:
+        if self.client is None:
+            raise RuntimeError("Gemini client not initialized")
+        response = self.client.models.generate_content(
+            model=MODEL_NAME,
+            contents=[
+                types.Part.from_bytes(data=jpeg_bytes, mime_type="image/jpeg"),
+                PROMPT,
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                response_mime_type="application/json",
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+            ),
+        )
+        return parse_detection_payload(response.text or "")
+
+
+detector = GeminiDetector()
+
+
+class LaptopCamera:
+    def __init__(self) -> None:
+        self.cap: Optional[cv2.VideoCapture] = None
+
+    def start(self) -> bool:
+        backend = cv2.CAP_AVFOUNDATION if platform.system() == "Darwin" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(CAMERA_INDEX, backend)
+        if not cap.isOpened():
+            cap = cv2.VideoCapture(CAMERA_INDEX)
+        if not cap.isOpened():
+            log("Failed to open laptop camera", "ERROR")
+            return False
+
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        self.cap = cap
+        with S.lock:
+            S.camera_ok = True
+        log(f"Laptop camera ready on index {CAMERA_INDEX}", "SUCCESS")
+        return True
+
+    def read(self) -> Optional[Any]:
+        if self.cap is None:
+            return None
+        ok, frame = self.cap.read()
+        if not ok:
+            return None
+        return frame
+
+    def stop(self) -> None:
+        if self.cap is not None:
+            self.cap.release()
+
+
+camera = LaptopCamera()
+
+
+def encode_jpeg(frame: Any) -> bytes:
+    ok, buffer = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+    if not ok:
+        raise RuntimeError("Failed to encode frame")
+    return buffer.tobytes()
+
+
+def draw_overlay(frame: Any, detections: List[Dict[str, Any]]) -> Any:
+    out = frame.copy()
+    height, width = out.shape[:2]
+    for det in detections:
+        box = det.get("box_2d")
+        if not isinstance(box, list) or len(box) != 4:
+            continue
+        x1, y1, x2, y2 = box_to_pixels(box, width, height)
+        if x2 <= x1 or y2 <= y1:
+            continue
+        state = str(det.get("state", "unknown")).lower()
+        color = (0, 255, 0) if state == "ripe" else (0, 165, 255) if state == "unripe" else (255, 220, 0)
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        label = det.get("label", "unknown")
+        notes = det.get("notes", "")
+        caption = f"{label} | {state}"
+        if isinstance(notes, str) and notes.strip():
+            caption = f"{caption} | {notes.strip()[:20]}"
+        (tw, th), baseline = cv2.getTextSize(caption, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
+        top = max(0, y1 - th - baseline - 8)
+        cv2.rectangle(out, (x1, top), (min(x1 + tw + 10, width - 1), y1), color, cv2.FILLED)
+        cv2.putText(
+            out,
+            caption,
+            (x1 + 5, max(16, y1 - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (0, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+    return out
+
+
+def run_detection(frame: Any) -> None:
+    with S.lock:
+        if S.request_in_flight or not S.gemini_ok:
+            return
+        S.request_in_flight = True
+        S.status = "Scanning with Gemini Robotics..."
+        S.last_scan_at = time.time()
+
+    try:
+        jpeg = encode_jpeg(frame)
+        payload = detector.detect(jpeg)
+        detections = payload["detections"]
+        scene_description = payload["scene_description"] or "No extra context"
+        with S.lock:
+            S.detections = detections
+            S.scene_description = scene_description
+            S.status = f"Detected {len(detections)} fruits/vegetables"
+        log(f"Detected {len(detections)} item(s)", "GEMINI")
+    except Exception as exc:
+        with S.lock:
+            S.status = "Detection failed"
+        log(f"Detection failed: {exc}", "ERROR")
+    finally:
+        with S.lock:
+            S.request_in_flight = False
+
+
+def capture_loop() -> None:
+    log("Capture loop started", "INFO")
+    while True:
+        frame = camera.read()
+        if frame is None:
+            time.sleep(0.05)
+            continue
+
+        with S.lock:
+            S.last_frame = frame.copy()
+            detections = list(S.detections)
+            running = S.running
+            gemini_ok = S.gemini_ok
+            last_scan_at = S.last_scan_at
+            request_in_flight = S.request_in_flight
+
+        if running and gemini_ok and not request_in_flight and (time.time() - last_scan_at) >= DETECT_INTERVAL:
+            threading.Thread(target=run_detection, args=(frame.copy(),), daemon=True).start()
+
+        display = draw_overlay(frame, detections)
+        try:
+            jpeg = encode_jpeg(display)
+            with S.lock:
+                S.last_jpeg = jpeg
+        except Exception as exc:
+            log(f"Preview encoding failed: {exc}", "WARN")
+
+        time.sleep(0.03)
+
+
+app = Flask(__name__)
+
+HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Gemini Fruit Webcam</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&family=DM+Sans:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#08111f;--card:#101826;--border:#213047;--accent:#3dd9b8;
+  --text:#e7edf5;--muted:#7f90aa;--surface:#162133;--warn:#ffb703;--bad:#ef476f;
+}
+body{font-family:'DM Sans',sans-serif;background:radial-gradient(circle at top,#12233f,#08111f 55%);color:var(--text);min-height:100vh}
+.header{
+  display:flex;justify-content:space-between;align-items:center;padding:14px 22px;
+  border-bottom:1px solid var(--border);background:rgba(8,17,31,.88);backdrop-filter:blur(10px);
+}
+.logo{font-family:'JetBrains Mono',monospace;font-size:18px;font-weight:700;color:var(--accent)}
+.status{display:flex;gap:16px;font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--muted)}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:6px;background:var(--bad)}
+.dot.on{background:var(--accent)}
+.layout{max-width:1380px;margin:0 auto;padding:18px;display:grid;grid-template-columns:minmax(0,1fr) 360px;gap:18px}
+@media(max-width:960px){.layout{grid-template-columns:1fr}}
+.card{background:rgba(16,24,38,.94);border:1px solid var(--border);border-radius:16px;padding:16px}
+.feed{width:100%;border-radius:12px;display:block;background:#000}
+.controls{display:flex;gap:10px;margin-top:14px}
+.btn{
+  border:none;border-radius:10px;padding:11px 14px;cursor:pointer;font-weight:700;
+  font-size:13px;font-family:'JetBrains Mono',monospace;
+}
+.btn-primary{background:var(--accent);color:#04110d}
+.btn-secondary{background:var(--surface);color:var(--text)}
+.section-title{
+  font-family:'JetBrains Mono',monospace;font-size:12px;letter-spacing:1px;
+  color:var(--muted);text-transform:uppercase;margin-bottom:10px
+}
+.status-line{font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text);margin-bottom:10px}
+.context{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px;
+  min-height:88px;font-size:14px;line-height:1.5
+}
+.detect-list{display:grid;gap:10px;margin-top:12px}
+.detect-item{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px
+}
+.detect-top{display:flex;justify-content:space-between;gap:10px;align-items:center;margin-bottom:6px}
+.badge{
+  border-radius:999px;padding:3px 8px;font-size:11px;font-family:'JetBrains Mono',monospace;background:#233247;color:var(--text)
+}
+.badge.ripe{background:rgba(61,217,184,.18);color:var(--accent)}
+.badge.unripe{background:rgba(255,183,3,.18);color:var(--warn)}
+.mono{font-family:'JetBrains Mono',monospace}
+.log-box{
+  margin-top:14px;background:var(--surface);border:1px solid var(--border);border-radius:12px;
+  padding:10px;height:180px;overflow:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.45
+}
+.log-line{padding:2px 0;border-bottom:1px solid rgba(127,144,170,.1)}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="logo">GEMINI FRUIT WEBCAM</div>
+  <div class="status">
+    <span><span class="dot" id="camDot"></span>Camera</span>
+    <span><span class="dot" id="gemDot"></span>Gemini</span>
+    <span id="runState">RUNNING</span>
+  </div>
+</div>
+<div class="layout">
+  <div class="card">
+    <img src="/video_feed" class="feed" alt="Webcam feed">
+    <div class="controls">
+      <button class="btn btn-primary" id="toggleBtn" onclick="toggleRunning()">Pause Scan</button>
+      <button class="btn btn-secondary" onclick="scanNow()">Scan Now</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="section-title">Status</div>
+    <div class="status-line" id="statusLine">Starting...</div>
+    <div class="section-title">Scene Context</div>
+    <div class="context" id="sceneBox">Waiting for first scan...</div>
+    <div class="section-title" style="margin-top:14px">Detections</div>
+    <div class="detect-list" id="detectList"></div>
+    <div class="section-title" style="margin-top:14px">Logs</div>
+    <div class="log-box" id="logBox"></div>
+  </div>
+</div>
+<script>
+let running = true;
+function api(path, body){
+  const opts = body ? {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)} : {};
+  return fetch('/api/' + path, opts).then(r => r.json());
+}
+function toggleRunning(){
+  running = !running;
+  api('running', {running}).then(refreshStatus);
+}
+function scanNow(){
+  api('scan', {});
+}
+function renderDetections(items){
+  const root = document.getElementById('detectList');
+  if(!items.length){
+    root.innerHTML = '<div class="detect-item">No fruits or vegetables detected.</div>';
+    return;
+  }
+  root.innerHTML = items.map((item, index) => {
+    const state = (item.state || 'unknown').toLowerCase();
+    const badgeClass = state === 'ripe' ? 'badge ripe' : state === 'unripe' ? 'badge unripe' : 'badge';
+    return `
+      <div class="detect-item">
+        <div class="detect-top">
+          <strong>${index + 1}. ${item.label}</strong>
+          <span class="${badgeClass}">${state}</span>
+        </div>
+        <div>${item.notes || 'No extra notes'}</div>
+        <div class="mono" style="margin-top:6px">box: ${JSON.stringify(item.box_2d || [])}</div>
+      </div>
+    `;
+  }).join('');
+}
+function renderLogs(lines){
+  const root = document.getElementById('logBox');
+  root.innerHTML = lines.map(line => `<div class="log-line">${line}</div>`).join('');
+  root.scrollTop = root.scrollHeight;
+}
+function refreshStatus(){
+  api('status').then(data => {
+    running = data.running;
+    document.getElementById('camDot').className = 'dot' + (data.camera_ok ? ' on' : '');
+    document.getElementById('gemDot').className = 'dot' + (data.gemini_ok ? ' on' : '');
+    document.getElementById('runState').textContent = data.running ? 'RUNNING' : 'PAUSED';
+    document.getElementById('statusLine').textContent = data.status;
+    document.getElementById('sceneBox').textContent = data.scene_description || 'No scene description';
+    document.getElementById('toggleBtn').textContent = data.running ? 'Pause Scan' : 'Resume Scan';
+    renderDetections(data.detections || []);
+  }).catch(() => {});
+}
+function refreshLogs(){
+  api('logs').then(data => renderLogs(data.logs || [])).catch(() => {});
+}
+setInterval(refreshStatus, 800);
+setInterval(refreshLogs, 1200);
+refreshStatus();
+refreshLogs();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index() -> str:
+    return render_template_string(HTML)
+
+
+@app.route("/video_feed")
+def video_feed() -> Response:
+    def generate() -> Any:
+        while True:
+            with S.lock:
+                frame = S.last_jpeg
+            if frame:
+                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+            time.sleep(0.033)
+
+    return Response(generate(), mimetype="multipart/x-mixed-replace; boundary=frame")
+
+
+@app.route("/api/status")
+def api_status() -> Response:
+    with S.lock:
+        return jsonify(
+            {
+                "running": S.running,
+                "camera_ok": S.camera_ok,
+                "gemini_ok": S.gemini_ok,
+                "status": S.status,
+                "scene_description": S.scene_description,
+                "detections": list(S.detections),
+            }
+        )
+
+
+@app.route("/api/logs")
+def api_logs() -> Response:
+    with S.lock:
+        return jsonify({"logs": S.logs[-60:]})
+
+
+@app.route("/api/running", methods=["POST"])
+def api_running() -> Response:
+    data = request.get_json(force=True) or {}
+    running = bool(data.get("running", True))
+    with S.lock:
+        S.running = running
+        S.status = "Scanning enabled" if running else "Scanning paused"
+    log("Scanning resumed" if running else "Scanning paused", "INFO")
+    return jsonify({"ok": True})
+
+
+@app.route("/api/scan", methods=["POST"])
+def api_scan() -> Response:
+    with S.lock:
+        frame = None if S.last_frame is None else S.last_frame.copy()
+        gemini_ok = S.gemini_ok
+    if frame is None or not gemini_ok:
+        return jsonify({"ok": False})
+    threading.Thread(target=run_detection, args=(frame,), daemon=True).start()
+    return jsonify({"ok": True})
+
+
+def main() -> None:
+    log("Gemini fruit webcam starting", "INFO")
+    if not camera.start():
+        return
+    detector.init()
+    threading.Thread(target=capture_loop, daemon=True).start()
+    log(f"Open http://0.0.0.0:{PORT}", "SUCCESS")
+    app.run(host="0.0.0.0", port=PORT, threaded=True, debug=False)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    finally:
+        camera.stop()
