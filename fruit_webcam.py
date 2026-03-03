@@ -11,6 +11,7 @@ Features:
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import platform
@@ -145,6 +146,25 @@ def box_to_pixels(box: List[int], width: int, height: int) -> tuple[int, int, in
     return x1, y1, x2, y2
 
 
+def detection_area(box: List[int]) -> int:
+    ymin, xmin, ymax, xmax = box
+    return max(0, ymax - ymin) * max(0, xmax - xmin)
+
+
+def best_detection(detections: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not detections:
+        return None
+
+    def score(item: Dict[str, Any]) -> tuple[int, int]:
+        state = str(item.get("state", "unknown")).lower()
+        state_score = 2 if state == "ripe" else 1 if state == "unknown" else 0
+        box = item.get("box_2d")
+        area = detection_area(box) if isinstance(box, list) and len(box) == 4 else 0
+        return state_score, area
+
+    return max(detections, key=score)
+
+
 class AppState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
@@ -158,7 +178,10 @@ class AppState:
         self.gemini_ok = False
         self.camera_ok = False
         self.last_scan_at = 0.0
+        self.last_completed_scan_at = 0.0
+        self.last_latency_ms: Optional[int] = None
         self.request_in_flight = False
+        self.recent_snapshots: List[Dict[str, str]] = []
 
 
 S = AppState()
@@ -265,6 +288,7 @@ def encode_jpeg(frame: Any) -> bytes:
 def draw_overlay(frame: Any, detections: List[Dict[str, Any]]) -> Any:
     out = frame.copy()
     height, width = out.shape[:2]
+    primary = best_detection(detections)
     for det in detections:
         box = det.get("box_2d")
         if not isinstance(box, list) or len(box) != 4:
@@ -274,7 +298,8 @@ def draw_overlay(frame: Any, detections: List[Dict[str, Any]]) -> Any:
             continue
         state = str(det.get("state", "unknown")).lower()
         color = (0, 255, 0) if state == "ripe" else (0, 165, 255) if state == "unripe" else (255, 220, 0)
-        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        thickness = 4 if det is primary else 2
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, thickness)
         label = det.get("label", "unknown")
         notes = det.get("notes", "")
         caption = f"{label} | {state}"
@@ -293,10 +318,55 @@ def draw_overlay(frame: Any, detections: List[Dict[str, Any]]) -> Any:
             2,
             cv2.LINE_AA,
         )
+        if det is primary:
+            cv2.putText(
+                out,
+                "PRIMARY",
+                (x1, min(height - 10, y2 + 18)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
     return out
 
 
+def make_snapshot(frame: Any, detections: List[Dict[str, Any]]) -> Optional[str]:
+    preview = draw_overlay(frame, detections)
+    height, width = preview.shape[:2]
+    target_width = 300
+    if width > target_width:
+        target_height = max(1, int(height * (target_width / width)))
+        preview = cv2.resize(preview, (target_width, target_height))
+    ok, buffer = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 60])
+    if not ok:
+        return None
+    encoded = base64.b64encode(buffer.tobytes()).decode("ascii")
+    return f"data:image/jpeg;base64,{encoded}"
+
+
+def store_snapshot(frame: Any, detections: List[Dict[str, Any]], scene_description: str) -> None:
+    image = make_snapshot(frame, detections)
+    if image is None:
+        return
+    primary = best_detection(detections)
+    title = "No detection"
+    if primary is not None:
+        title = f"{primary.get('label', 'unknown')} | {primary.get('state', 'unknown')}"
+    snapshot = {
+        "image": image,
+        "title": title,
+        "subtitle": scene_description[:60] if scene_description else "No scene summary",
+        "time": time.strftime("%H:%M:%S"),
+    }
+    with S.lock:
+        S.recent_snapshots.insert(0, snapshot)
+        S.recent_snapshots = S.recent_snapshots[:4]
+
+
 def run_detection(frame: Any) -> None:
+    started_at = time.time()
     with S.lock:
         if S.request_in_flight or not S.gemini_ok:
             return
@@ -309,14 +379,21 @@ def run_detection(frame: Any) -> None:
         payload = detector.detect(jpeg)
         detections = payload["detections"]
         scene_description = payload["scene_description"] or "No extra context"
+        latency_ms = int((time.time() - started_at) * 1000)
         with S.lock:
             S.detections = detections
             S.scene_description = scene_description
             S.status = f"Detected {len(detections)} fruits/vegetables"
+            S.last_latency_ms = latency_ms
+            S.last_completed_scan_at = time.time()
+        if detections:
+            store_snapshot(frame, detections, scene_description)
         log(f"Detected {len(detections)} item(s)", "GEMINI")
     except Exception as exc:
         with S.lock:
             S.status = "Detection failed"
+            S.last_latency_ms = int((time.time() - started_at) * 1000)
+            S.last_completed_scan_at = time.time()
         log(f"Detection failed: {exc}", "ERROR")
     finally:
         with S.lock:
@@ -397,6 +474,19 @@ body{font-family:'DM Sans',sans-serif;background:radial-gradient(circle at top,#
   background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px;
   min-height:88px;font-size:14px;line-height:1.5
 }
+.hero{
+  background:linear-gradient(135deg,rgba(61,217,184,.15),rgba(61,217,184,.05));
+  border:1px solid rgba(61,217,184,.25);border-radius:14px;padding:14px;margin-bottom:14px
+}
+.hero-kicker{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+.hero-title{font-size:24px;font-weight:700;margin-top:6px}
+.hero-sub{margin-top:6px;color:var(--muted);font-size:13px}
+.metrics{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+.metric{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px
+}
+.metric-label{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--muted);text-transform:uppercase}
+.metric-value{font-size:20px;font-weight:700;margin-top:5px}
 .detect-list{display:grid;gap:10px;margin-top:12px}
 .detect-item{
   background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:12px
@@ -413,6 +503,13 @@ body{font-family:'DM Sans',sans-serif;background:radial-gradient(circle at top,#
   padding:10px;height:180px;overflow:auto;font-family:'JetBrains Mono',monospace;font-size:11px;line-height:1.45
 }
 .log-line{padding:2px 0;border-bottom:1px solid rgba(127,144,170,.1)}
+.gallery{display:grid;gap:10px;margin-top:12px}
+.shot{
+  background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:10px
+}
+.shot img{width:100%;border-radius:8px;display:block;background:#000}
+.shot-title{font-weight:700;margin-top:8px}
+.shot-sub{font-size:12px;color:var(--muted);margin-top:4px}
 </style>
 </head>
 <body>
@@ -433,12 +530,29 @@ body{font-family:'DM Sans',sans-serif;background:radial-gradient(circle at top,#
     </div>
   </div>
   <div class="card">
+    <div class="hero">
+      <div class="hero-kicker">Best Detection</div>
+      <div class="hero-title" id="heroTitle">Waiting...</div>
+      <div class="hero-sub" id="heroSub">Gemini will highlight the strongest fruit or vegetable here.</div>
+    </div>
+    <div class="metrics">
+      <div class="metric">
+        <div class="metric-label">Last Scan</div>
+        <div class="metric-value" id="lastScanValue">-</div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Latency</div>
+        <div class="metric-value" id="latencyValue">-</div>
+      </div>
+    </div>
     <div class="section-title">Status</div>
     <div class="status-line" id="statusLine">Starting...</div>
     <div class="section-title">Scene Context</div>
     <div class="context" id="sceneBox">Waiting for first scan...</div>
     <div class="section-title" style="margin-top:14px">Detections</div>
     <div class="detect-list" id="detectList"></div>
+    <div class="section-title" style="margin-top:14px">Recent Snapshots</div>
+    <div class="gallery" id="gallery"></div>
     <div class="section-title" style="margin-top:14px">Logs</div>
     <div class="log-box" id="logBox"></div>
   </div>
@@ -455,6 +569,23 @@ function toggleRunning(){
 }
 function scanNow(){
   api('scan', {});
+}
+function formatLastScan(ts){
+  if(!ts){ return '-'; }
+  const seconds = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  return seconds === 0 ? 'just now' : `${seconds}s ago`;
+}
+function renderHero(best){
+  const title = document.getElementById('heroTitle');
+  const sub = document.getElementById('heroSub');
+  if(!best){
+    title.textContent = 'No target';
+    sub.textContent = 'No fruit or vegetable is currently highlighted.';
+    return;
+  }
+  const state = (best.state || 'unknown').toLowerCase();
+  title.textContent = `${best.label} | ${state}`;
+  sub.textContent = best.notes || 'Gemini marked this as the strongest current detection.';
 }
 function renderDetections(items){
   const root = document.getElementById('detectList');
@@ -477,6 +608,20 @@ function renderDetections(items){
     `;
   }).join('');
 }
+function renderGallery(items){
+  const root = document.getElementById('gallery');
+  if(!items.length){
+    root.innerHTML = '<div class="shot">No saved detections yet.</div>';
+    return;
+  }
+  root.innerHTML = items.map(item => `
+    <div class="shot">
+      <img src="${item.image}" alt="${item.title}">
+      <div class="shot-title">${item.title}</div>
+      <div class="shot-sub">${item.time} | ${item.subtitle}</div>
+    </div>
+  `).join('');
+}
 function renderLogs(lines){
   const root = document.getElementById('logBox');
   root.innerHTML = lines.map(line => `<div class="log-line">${line}</div>`).join('');
@@ -491,7 +636,11 @@ function refreshStatus(){
     document.getElementById('statusLine').textContent = data.status;
     document.getElementById('sceneBox').textContent = data.scene_description || 'No scene description';
     document.getElementById('toggleBtn').textContent = data.running ? 'Pause Scan' : 'Resume Scan';
+    document.getElementById('lastScanValue').textContent = formatLastScan(data.last_completed_scan_at);
+    document.getElementById('latencyValue').textContent = data.last_latency_ms ? `${data.last_latency_ms} ms` : '-';
+    renderHero(data.best_detection || null);
     renderDetections(data.detections || []);
+    renderGallery(data.recent_snapshots || []);
   }).catch(() => {});
 }
 function refreshLogs(){
@@ -536,6 +685,10 @@ def api_status() -> Response:
                 "status": S.status,
                 "scene_description": S.scene_description,
                 "detections": list(S.detections),
+                "best_detection": best_detection(list(S.detections)),
+                "last_latency_ms": S.last_latency_ms,
+                "last_completed_scan_at": S.last_completed_scan_at,
+                "recent_snapshots": list(S.recent_snapshots),
             }
         )
 
