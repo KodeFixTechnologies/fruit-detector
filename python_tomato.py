@@ -63,7 +63,7 @@ class Config:
     auto_stop_settle: float = 0.5
     auto_resume_delay: float = 1.0
 
-    model_path: str = "/home/anjaly/Downloads/best.pt"
+    model_path: str = "/home/anjaly/fruit-detector/best_ncnn_model"
     confidence_threshold: float = 0.4
     min_detection_size: int = 50
     tomato_diameter_ref: float = 6.0

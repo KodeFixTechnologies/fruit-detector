@@ -10,6 +10,7 @@ Architecture:
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import re
@@ -59,6 +60,10 @@ class Config:
     auto_rover_speed: int = 45
     auto_stop_settle: float = 0.5
     auto_resume_delay: float = 1.0
+    # Autonomous step-scan timing (all values in SECONDS, not milliseconds)
+    scan_step_duration: float = 0.8   # how long the rover drives between scans (0.8 s = 800 ms)
+    scan_settle_time: float = 0.3     # camera settle pause after stopping before scanning (300 ms)
+    gemini_timeout: float = 10.0      # max seconds to wait for Gemini API response before giving up
 
     base_min: int = 70
     base_max: int = 160
@@ -685,6 +690,14 @@ class GeminiController:
         )
         return (response.text or "").strip()
 
+    def _call_with_timeout(self, image_bytes: bytes, prompt: str) -> str:
+        """Run _call in a thread with a hard timeout (cfg.gemini_timeout seconds).
+        If the network is slow or the API hangs, raises TimeoutError so the
+        caller can skip this scan and continue without blocking the rover."""
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+            future = ex.submit(self._call, image_bytes, prompt)
+            return future.result(timeout=cfg.gemini_timeout)
+
     def _norm_to_cm(self, x_norm: float, y_norm: float) -> Tuple[float, float]:
         x_cm = 5 + (x_norm / 1000.0) * 25
         y_cm = ((y_norm - 500) / 500.0) * 15
@@ -693,7 +706,7 @@ class GeminiController:
     def detect(self, image_bytes: bytes) -> Tuple[List[Dict[str, Any]], str]:
         if self.client is None:
             return [], ""
-        raw_result = parse_json_safe(self._call(image_bytes, DETECT_PROMPT))
+        raw_result = parse_json_safe(self._call_with_timeout(image_bytes, DETECT_PROMPT))
         result = normalize_detection_result(raw_result)
         detections: List[Dict[str, Any]] = []
         target = result["recommended_target"]
@@ -852,6 +865,8 @@ def trigger_detect(frame: np.ndarray) -> None:
             log(f"Detected {len(detections)} items ({ripe_count} ripe)", "GEMINI")
         else:
             log("No harvestable produce visible", "GEMINI")
+    except concurrent.futures.TimeoutError:
+        log(f"Gemini timeout after {cfg.gemini_timeout:.0f}s (bad network) — skipping scan", "WARN")
     except Exception as exc:
         log(f"Detection failed: {exc}", "ERROR")
 
@@ -922,6 +937,7 @@ def draw_overlay(frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndar
 def control_loop() -> None:
     log("Control loop started", "INFO")
     last_detect = 0.0
+    scan_step_start: float = 0.0  # when the current autonomous step started
 
     while True:
         if not camera.ok:
@@ -934,11 +950,15 @@ def control_loop() -> None:
             continue
 
         now = time.time()
+
+        # Semi-auto and manual use the timer-based detection as before.
+        # Autonomous mode manages its own scan cadence via the step-scan cycle below.
         with S.lock:
             should_detect = (
                 S.running
                 and S.gemini_ok
                 and not S.arm_busy
+                and S.mode != "autonomous"
                 and (now - last_detect) >= cfg.detect_interval
             )
             detections = list(S.detections)
@@ -951,23 +971,43 @@ def control_loop() -> None:
 
         if S.mode == "autonomous" and S.running and not arm.busy:
             det = best_pickable_detection()
+
             if det and det["width_norm"] >= cfg.auto_pick_box_width_norm:
+                # Confirmed fruit in range — stop and pick.
                 if S.rover_moving:
                     rover.stop()
                     time.sleep(cfg.auto_stop_settle)
                 x_cm, y_cm = det["robot_coords"]
                 arm.pick(x_cm, y_cm, det["diameter_cm"])
-                # Reset last_detect so the loop waits a full detect_interval before
-                # scanning again. Without this, the very next iteration immediately
-                # re-detects (pick takes >>3s), Gemini may still see a fruit, and
-                # rover.stop() fires milliseconds after rover.forward(), causing the
-                # sudden stop/jolt that looks like going backward.
+                # After pick, reset so the next step starts fresh.
                 last_detect = time.time()
+                scan_step_start = time.time()
                 time.sleep(cfg.auto_resume_delay)
                 if S.running and S.mode == "autonomous":
                     rover.forward(cfg.auto_rover_speed)
-            elif not S.rover_moving:
+                    scan_step_start = time.time()
+
+            elif S.rover_moving:
+                # Mid-step — check if the step duration has elapsed.
+                if now - scan_step_start >= cfg.scan_step_duration:
+                    # Step done: stop, let the camera settle, then scan with Gemini.
+                    # Rover is stationary for the entire Gemini round-trip, so the
+                    # detected position exactly matches the rover's actual position.
+                    rover.stop()
+                    time.sleep(cfg.scan_settle_time)
+                    fresh = camera.capture_frame()
+                    if fresh is not None:
+                        trigger_detect(fresh)
+                        with S.lock:
+                            detections = list(S.detections)
+                    last_detect = time.time()
+                    # Don't restart rover here — next iteration checks detections and
+                    # either picks (if det found) or kicks off the next step (else branch).
+
+            else:
+                # Rover is stopped and no in-range fruit — start the next step.
                 rover.forward(cfg.auto_rover_speed)
+                scan_step_start = time.time()
 
         elif S.mode == "semi-auto" and S.running and not arm.busy:
             det = best_pickable_detection()
