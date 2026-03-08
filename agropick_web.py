@@ -523,7 +523,20 @@ class ArmController:
             log("Step 6/6: Lift and home", "ARM")
             self.move_to_xyz(x, y, cfg.grab_h + cfg.lift_h)
             time.sleep(0.5)
-            self.home()
+            # Call serial_mgr.home() directly to avoid arm.home()'s finally block
+            # prematurely setting arm.busy=False while pick() is still running.
+            log("Moving to HOME", "ARM")
+            serial_mgr.home()
+            self.positions = {
+                "base": cfg.home_base,
+                "shoulder": max(cfg.home_shoulder, 150),
+                "wrist": cfg.home_wrist,
+                "gripper": cfg.home_gripper,
+                "rotgripper": cfg.home_rotgrip,
+            }
+            with S.lock:
+                S.arm_pos = self.positions.copy()
+            log("HOME complete", "SUCCESS")
             self._send("gripper", cfg.gripper_min)
 
             with S.lock:
@@ -944,6 +957,12 @@ def control_loop() -> None:
                     time.sleep(cfg.auto_stop_settle)
                 x_cm, y_cm = det["robot_coords"]
                 arm.pick(x_cm, y_cm, det["diameter_cm"])
+                # Reset last_detect so the loop waits a full detect_interval before
+                # scanning again. Without this, the very next iteration immediately
+                # re-detects (pick takes >>3s), Gemini may still see a fruit, and
+                # rover.stop() fires milliseconds after rover.forward(), causing the
+                # sudden stop/jolt that looks like going backward.
+                last_detect = time.time()
                 time.sleep(cfg.auto_resume_delay)
                 if S.running and S.mode == "autonomous":
                     rover.forward(cfg.auto_rover_speed)

@@ -536,7 +536,20 @@ class ArmController:
             log("Step 6/6: Lift and home", "ARM")
             self.move_to_xyz(x, y, cfg.grab_h + cfg.lift_h)
             time.sleep(0.5)
-            self.home()
+            # Call serial_mgr.home() directly to avoid arm.home()'s finally block
+            # prematurely setting arm.busy=False while pick() is still running.
+            log("Moving to HOME", "ARM")
+            serial_mgr.home()
+            self.positions = {
+                "base": cfg.home_base,
+                "shoulder": max(cfg.home_shoulder, 150),
+                "wrist": cfg.home_wrist,
+                "gripper": cfg.home_gripper,
+                "rotgripper": cfg.home_rotgrip,
+            }
+            with S.lock:
+                S.arm_pos = self.positions.copy()
+            log("HOME complete", "SUCCESS")
             self._send("gripper", cfg.gripper_min)
 
             with S.lock:
@@ -579,6 +592,34 @@ class TomatoVisionController:
             log(f"YOLO failed: {exc}", "ERROR")
             return False
 
+    def _color_matches_tomato(self, frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, label: str) -> bool:
+        """
+        Confirm the dominant HSV color inside the bounding box looks like a tomato.
+        Ripe   → red/orange pixels  (H: 0-15 or 160-180, S>80, V>60)
+        Unripe → green/yellow pixels (H: 25-85, S>60, V>50)
+        At least 20% of the cropped pixels must match the expected color range.
+        This rejects false positives like skin, clothing, or background objects.
+        """
+        crop = frame[max(0, y1):y2, max(0, x1):x2]
+        if crop.size == 0:
+            return False
+
+        # Convert BGR→HSV (frame is already BGR from OpenCV/PiCamera)
+        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+        total = hsv.shape[0] * hsv.shape[1]
+
+        if label.lower() == "ripe":
+            # Red wraps around 0° in HSV — need two ranges
+            mask1 = cv2.inRange(hsv, np.array([0, 80, 60]),   np.array([15, 255, 255]))
+            mask2 = cv2.inRange(hsv, np.array([160, 80, 60]), np.array([180, 255, 255]))
+            matched = cv2.countNonZero(mask1) + cv2.countNonZero(mask2)
+        else:
+            # Unripe: green/yellow
+            mask = cv2.inRange(hsv, np.array([25, 60, 50]), np.array([85, 255, 255]))
+            matched = cv2.countNonZero(mask)
+
+        return (matched / total) >= 0.20
+
     def _pixel_to_robot(self, center_x: int, center_y: int, frame_w: int, frame_h: int) -> Tuple[float, float]:
         x_norm = center_x / max(frame_w, 1)
         y_norm = center_y / max(frame_h, 1)
@@ -600,12 +641,31 @@ class TomatoVisionController:
                 names = self.model.names
                 label = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else str(names[cls_id])
                 label = str(label)
+
+                # Only accept tomato classes from the custom model — anything
+                # else (person, clothing, background objects) gets dropped here.
+                if label.lower() not in ("ripe", "unripe"):
+                    continue
+
                 conf = float(box.conf[0])
 
                 x1, y1, x2, y2 = map(int, box.xyxy[0])
                 width = x2 - x1
                 height = y2 - y1
-                if width < cfg.min_detection_size:
+
+                # Must be large enough in both dimensions.
+                if width < cfg.min_detection_size or height < cfg.min_detection_size:
+                    continue
+
+                # Aspect ratio guard: tomatoes are roughly circular.
+                # A chest/shirt/large flat object will have a very skewed ratio.
+                aspect = width / height if height > 0 else 999
+                if not (0.4 <= aspect <= 2.5):
+                    continue
+
+                # Color guard: verify the dominant color inside the box matches
+                # what a ripe (red/orange) or unripe (green/yellow) tomato looks like.
+                if not self._color_matches_tomato(frame, x1, y1, x2, y2, label):
                     continue
 
                 center_x = (x1 + x2) // 2
@@ -866,6 +926,12 @@ def control_loop() -> None:
                     time.sleep(cfg.auto_stop_settle)
                 x_cm, y_cm = det["robot_coords"]
                 arm.pick(x_cm, y_cm, det["diameter_cm"])
+                # Reset last_detect so the loop waits a full detect_interval before
+                # scanning again. Without this, the very next iteration immediately
+                # re-detects (pick takes >>detect_interval), YOLO may still see a
+                # fruit, and rover.stop() fires milliseconds after rover.forward(),
+                # causing the sudden stop/jolt that looks like going backward.
+                last_detect = time.time()
                 time.sleep(cfg.auto_resume_delay)
                 if S.running and S.mode == "autonomous":
                     rover.forward(cfg.auto_rover_speed)
