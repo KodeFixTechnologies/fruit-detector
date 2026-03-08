@@ -36,6 +36,14 @@ try:
 except ImportError:
     HAS_AF = False
 
+try:
+    from ultralytics import YOLO
+
+    HAS_YOLO = True
+except ImportError:
+    YOLO = None
+    HAS_YOLO = False
+
 
 load_dotenv()
 
@@ -65,6 +73,13 @@ class Config:
     scan_settle_time: float = 0.3     # camera settle pause after stopping before scanning (300 ms)
     gemini_timeout: float = 10.0      # max seconds to wait for Gemini API response before giving up
 
+    vision_model: str = "gemini"      # "gemini" or "yolo"
+    model_path: str = "/home/anjaly/fruit-detector/best_ncnn_model"
+    confidence_threshold: float = 0.4
+    min_detection_size: int = 50
+    tomato_diameter_ref: float = 6.0
+    focal_length: float = 1400.0
+
     base_min: int = 70
     base_max: int = 160
     shoulder_min: int = 120
@@ -92,6 +107,8 @@ class Config:
     twist_delay: float = 0.25
     approach_h: float = 8.0
     grab_h: float = 3.0
+    pick_drop_extra: float = 2.0
+    grip_extra_close: int = 10
     lift_h: float = 10.0
 
     port: int = 5000
@@ -132,6 +149,7 @@ class State:
         self.running = False
         self.esp_ok = False
         self.gemini_ok = False
+        self.yolo_ok = False
         self.rover_moving = False
         self.rover_dir = "stopped"
         self.arm_busy = False
@@ -504,7 +522,7 @@ class ArmController:
             time.sleep(0.5)
 
             log("Step 3/6: Lower to target", "ARM")
-            self.move_to_xyz(x, y, cfg.grab_h)
+            self.move_to_xyz(x, y, cfg.grab_h - cfg.pick_drop_extra)
             time.sleep(0.5)
 
             log("Step 4/6: Grip", "ARM")
@@ -512,7 +530,7 @@ class ArmController:
             grip_angle = cfg.gripper_min + int(
                 (1 - min(diameter_cm, 8.0) / 8.0) * angle_range
             )
-            grip_angle = int(np.clip(grip_angle, cfg.gripper_min, cfg.gripper_max))
+            grip_angle = int(np.clip(grip_angle + cfg.grip_extra_close, cfg.gripper_min, cfg.gripper_max))
             self._send("gripper", grip_angle)
             time.sleep(0.5)
 
@@ -769,6 +787,91 @@ class GeminiController:
 gemini = GeminiController()
 
 
+class YOLOController:
+    def __init__(self) -> None:
+        self.model: Any = None
+
+    def init(self) -> bool:
+        if not HAS_YOLO:
+            with S.lock:
+                S.yolo_ok = False
+            log("ultralytics not installed — YOLO unavailable", "ERROR")
+            return False
+        try:
+            self.model = YOLO(cfg.model_path)
+            with S.lock:
+                S.yolo_ok = True
+            log(f"YOLO ready: {cfg.model_path}", "SUCCESS")
+            return True
+        except Exception as exc:
+            with S.lock:
+                S.yolo_ok = False
+            log(f"YOLO failed: {exc}", "ERROR")
+            return False
+
+    def _pixel_to_robot(self, cx: int, cy: int, fw: int, fh: int) -> Tuple[float, float]:
+        x_cm = 5 + (cx / max(fw, 1)) * 25
+        y_cm = ((cy / max(fh, 1)) - 0.5) * 15
+        return x_cm, y_cm
+
+    def detect(self, frame: np.ndarray) -> Tuple[List[Dict[str, Any]], str]:
+        if self.model is None:
+            return [], ""
+        results = self.model(frame, conf=cfg.confidence_threshold, verbose=False)
+        fh, fw = frame.shape[:2]
+        detections: List[Dict[str, Any]] = []
+        for result in results:
+            for box in result.boxes:
+                cls_id = int(box.cls[0])
+                names = self.model.names
+                label = names.get(cls_id, str(cls_id)) if isinstance(names, dict) else str(names[cls_id])
+                label = str(label)
+                if label.lower() not in ("ripe", "unripe"):
+                    continue
+                conf = float(box.conf[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                width = x2 - x1
+                height = y2 - y1
+                if width < cfg.min_detection_size or height < cfg.min_detection_size:
+                    continue
+                aspect = width / height if height > 0 else 999
+                if not (0.4 <= aspect <= 2.5):
+                    continue
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                pixel_size = (width + height) / 2.0
+                distance = (cfg.tomato_diameter_ref * cfg.focal_length) / width if width > 0 else cfg.focal_length
+                diameter = (pixel_size * distance) / cfg.focal_length
+                x_cm, y_cm = self._pixel_to_robot(cx, cy, fw, fh)
+                is_ripe = label.lower() == "ripe"
+                detections.append({
+                    "label": label,
+                    "confidence": conf,
+                    "is_ripe": is_ripe,
+                    "diameter_cm": float(diameter),
+                    "can_grip": float(diameter) <= 8.0,
+                    "box_norm": [
+                        int(np.clip(y1 / fh * 1000, 0, 1000)),
+                        int(np.clip(x1 / fw * 1000, 0, 1000)),
+                        int(np.clip(y2 / fh * 1000, 0, 1000)),
+                        int(np.clip(x2 / fw * 1000, 0, 1000)),
+                    ],
+                    "pick_norm": [
+                        int(np.clip(cy / fh * 1000, 0, 1000)),
+                        int(np.clip(cx / fw * 1000, 0, 1000)),
+                    ],
+                    "width_norm": int(np.clip(width / fw * 1000, 0, 1000)),
+                    "robot_coords": (x_cm, y_cm),
+                    "is_target": is_ripe,
+                })
+        detections.sort(key=lambda d: (not d["is_target"], not d["can_grip"], -d["confidence"], -d["width_norm"]))
+        ripe = sum(1 for d in detections if d["is_ripe"])
+        return detections, f"{ripe} ripe, {len(detections) - ripe} unripe"
+
+
+yolo = YOLOController()
+
+
 class PiCamera:
     def __init__(self) -> None:
         self.cam: Optional[Picamera2] = None
@@ -863,16 +966,25 @@ def best_pickable_detection() -> Optional[Dict[str, Any]]:
 
 
 def trigger_detect(frame: np.ndarray) -> None:
-    if not S.gemini_ok or arm.busy:
+    if arm.busy:
         return
     try:
-        detections, scene_desc = gemini.detect(camera.frame_to_jpeg(frame))
+        if cfg.vision_model == "yolo":
+            if not S.yolo_ok:
+                return
+            detections, scene_desc = yolo.detect(frame)
+            tag = "YOLO"
+        else:
+            if not S.gemini_ok:
+                return
+            detections, scene_desc = gemini.detect(camera.frame_to_jpeg(frame))
+            tag = "GEMINI"
         update_detection_state(detections, scene_desc)
         if detections:
             ripe_count = sum(1 for item in detections if item["is_ripe"])
-            log(f"Detected {len(detections)} items ({ripe_count} ripe)", "GEMINI")
+            log(f"Detected {len(detections)} items ({ripe_count} ripe)", tag)
         else:
-            log("No harvestable produce visible", "GEMINI")
+            log("No harvestable produce visible", tag)
     except concurrent.futures.TimeoutError:
         log(f"Gemini timeout after {cfg.gemini_timeout:.0f}s (bad network) — skipping scan", "WARN")
     except Exception as exc:
@@ -962,9 +1074,10 @@ def control_loop() -> None:
         # Semi-auto and manual use the timer-based detection as before.
         # Autonomous mode manages its own scan cadence via the step-scan cycle below.
         with S.lock:
+            vision_ready = S.yolo_ok if cfg.vision_model == "yolo" else S.gemini_ok
             should_detect = (
                 S.running
-                and S.gemini_ok
+                and vision_ready
                 and not S.arm_busy
                 and S.mode != "autonomous"
                 and (now - last_detect) >= cfg.detect_interval
@@ -1122,7 +1235,7 @@ input[type=range]::-webkit-slider-thumb{
   <div class="logo">AGROPICK</div>
   <div class="header-status">
     <span><span class="dot" id="espDot"></span>ESP32</span>
-    <span><span class="dot" id="gemDot"></span>Gemini</span>
+    <span><span class="dot" id="visionDot"></span><span id="visionLabel">Gemini</span></span>
     <span id="modeLabel">MANUAL</span>
   </div>
 </div>
@@ -1141,6 +1254,7 @@ input[type=range]::-webkit-slider-thumb{
         <button class="btn btn-go" id="startBtn" onclick="toggleSys()">START</button>
         <button class="btn btn-home" onclick="api('arm/home')">HOME</button>
         <button class="btn btn-home" onclick="api('scan')">SCAN</button>
+        <button class="btn btn-home" id="visionToggle" onclick="toggleVision()">YOLO</button>
       </div>
       <h3>Rover</h3>
       <div class="rover-pad">
@@ -1194,6 +1308,10 @@ input[type=range]::-webkit-slider-thumb{
         <label style="margin-bottom:8px;display:flex;align-items:center;gap:6px">
           <input type="checkbox" id="ikIB">Invert Base
         </label>
+        <label>Extra Drop (cm)</label>
+        <input type="number" class="ik-input" id="ikDE" value="2.0" min="0" max="10" step="0.5">
+        <label>Extra Grip Close (deg)</label>
+        <input type="number" class="ik-input" id="ikGE" value="10" min="0" max="40" step="1">
         <button class="btn-save" onclick="saveIK()">Save IK</button>
       </div>
     </div>
@@ -1231,13 +1349,29 @@ function saveIK(){
     base_center:+document.getElementById('ikBC').value,
     shoulder_offset:+document.getElementById('ikSO').value,
     shoulder_mult:+document.getElementById('ikSM').value,
-    invert_base:document.getElementById('ikIB').checked
+    invert_base:document.getElementById('ikIB').checked,
+    pick_drop_extra:+document.getElementById('ikDE').value,
+    grip_extra_close:+document.getElementById('ikGE').value
+  });
+}
+let currentVisionModel='gemini';
+function toggleVision(){
+  const next=currentVisionModel==='gemini'?'yolo':'gemini';
+  api('vision_model',{model:next}).then(()=>{
+    currentVisionModel=next;
+    document.getElementById('visionToggle').textContent=next==='gemini'?'YOLO':'GEMINI';
   });
 }
 function poll(){
   api('status').then(d=>{
     document.getElementById('espDot').className='dot'+(d.esp_ok?' on':'');
-    document.getElementById('gemDot').className='dot'+(d.gemini_ok?' on':'');
+    const visionOk=d.vision_model==='yolo'?d.yolo_ok:d.gemini_ok;
+    document.getElementById('visionDot').className='dot'+(visionOk?' on':'');
+    document.getElementById('visionLabel').textContent=d.vision_model==='yolo'?'YOLO':'Gemini';
+    if(d.vision_model!==currentVisionModel){
+      currentVisionModel=d.vision_model;
+      document.getElementById('visionToggle').textContent=d.vision_model==='gemini'?'YOLO':'GEMINI';
+    }
     document.getElementById('sOk').textContent=d.picks_ok;
     document.getElementById('sTry').textContent=d.picks_try;
     document.getElementById('sRipe').textContent=d.ripe_count;
@@ -1262,6 +1396,8 @@ api('ik').then(d=>{
   document.getElementById('ikSO').value=d.shoulder_offset;
   document.getElementById('ikSM').value=d.shoulder_mult;
   document.getElementById('ikIB').checked=d.invert_base;
+  document.getElementById('ikDE').value=d.pick_drop_extra;
+  document.getElementById('ikGE').value=d.grip_extra_close;
 }).catch(()=>{});
 setInterval(poll,600);
 setInterval(pollLogs,1200);
@@ -1298,6 +1434,8 @@ def api_status() -> Response:
                 "running": S.running,
                 "esp_ok": S.esp_ok,
                 "gemini_ok": S.gemini_ok,
+                "yolo_ok": S.yolo_ok,
+                "vision_model": cfg.vision_model,
                 "rover_moving": S.rover_moving,
                 "rover_dir": S.rover_dir,
                 "arm_busy": S.arm_busy,
@@ -1361,6 +1499,8 @@ def api_ik() -> Response:
                 "shoulder_offset": cfg.ik_shoulder_offset,
                 "shoulder_mult": cfg.ik_shoulder_mult,
                 "invert_base": cfg.invert_base,
+                "pick_drop_extra": cfg.pick_drop_extra,
+                "grip_extra_close": cfg.grip_extra_close,
             }
         )
     data = request.get_json(force=True) or {}
@@ -1368,14 +1508,34 @@ def api_ik() -> Response:
     cfg.ik_shoulder_offset = float(data.get("shoulder_offset", cfg.ik_shoulder_offset))
     cfg.ik_shoulder_mult = float(data.get("shoulder_mult", cfg.ik_shoulder_mult))
     cfg.invert_base = bool(data.get("invert_base", cfg.invert_base))
+    cfg.pick_drop_extra = float(data.get("pick_drop_extra", cfg.pick_drop_extra))
+    cfg.grip_extra_close = int(data.get("grip_extra_close", cfg.grip_extra_close))
     cfg.save()
     log("IK saved", "INFO")
     return jsonify({"ok": True})
 
 
+@app.route("/api/vision_model", methods=["POST"])
+def api_vision_model() -> Response:
+    data = request.get_json(force=True) or {}
+    model = data.get("model", cfg.vision_model)
+    if model not in ("gemini", "yolo"):
+        return jsonify({"ok": False, "error": "model must be 'gemini' or 'yolo'"})
+    cfg.vision_model = model
+    cfg.save()
+    # Init the selected backend if not already ready
+    if model == "yolo" and not S.yolo_ok:
+        threading.Thread(target=yolo.init, daemon=True).start()
+    elif model == "gemini" and not S.gemini_ok:
+        threading.Thread(target=gemini.init, daemon=True).start()
+    log(f"Vision model switched to: {model}", "INFO")
+    return jsonify({"ok": True, "vision_model": model})
+
+
 @app.route("/api/scan", methods=["GET", "POST"])
 def api_scan() -> Response:
-    if not camera.ok or not S.gemini_ok or arm.busy:
+    vision_ready = S.yolo_ok if cfg.vision_model == "yolo" else S.gemini_ok
+    if not camera.ok or not vision_ready or arm.busy:
         return jsonify({"ok": False})
 
     def worker() -> None:
@@ -1444,6 +1604,8 @@ def main() -> None:
         log("Camera required - exiting", "ERROR")
         return
     gemini.init()
+    if cfg.vision_model == "yolo":
+        yolo.init()
     if serial_mgr.connected:
         arm.home()
     else:

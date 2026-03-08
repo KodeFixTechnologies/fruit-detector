@@ -96,6 +96,8 @@ class Config:
     twist_delay: float = 0.25
     approach_h: float = 8.0
     grab_h: float = 3.0
+    pick_drop_extra: float = 2.0
+    grip_extra_close: int = 10
     lift_h: float = 10.0
 
     port: int = 5001
@@ -514,13 +516,13 @@ class ArmController:
             time.sleep(0.5)
 
             log("Step 3/6: Lower to target", "ARM")
-            self.move_to_xyz(x, y, cfg.grab_h)
+            self.move_to_xyz(x, y, cfg.grab_h - cfg.pick_drop_extra)
             time.sleep(0.5)
 
             log("Step 4/6: Grip", "ARM")
             angle_range = cfg.gripper_max - cfg.gripper_min
             grip_angle = cfg.gripper_min + int((1 - min(diameter_cm, 8.0) / 8.0) * angle_range)
-            grip_angle = int(np.clip(grip_angle, cfg.gripper_min, cfg.gripper_max))
+            grip_angle = int(np.clip(grip_angle + cfg.grip_extra_close, cfg.gripper_min, cfg.gripper_max))
             self._send("gripper", grip_angle)
             time.sleep(0.5)
 
@@ -1090,6 +1092,10 @@ input[type=range]::-webkit-slider-thumb{
         <label style="margin-bottom:8px;display:flex;align-items:center;gap:6px">
           <input type="checkbox" id="ikIB">Invert Base
         </label>
+        <label>Extra Drop (cm)</label>
+        <input type="number" class="ik-input" id="ikDE" value="2.0" min="0" max="10" step="0.5">
+        <label>Extra Grip Close (deg)</label>
+        <input type="number" class="ik-input" id="ikGE" value="10" min="0" max="40" step="1">
         <button class="btn-save" onclick="saveIK()">Save IK</button>
       </div>
     </div>
@@ -1127,7 +1133,9 @@ function saveIK(){
     base_center:+document.getElementById('ikBC').value,
     shoulder_offset:+document.getElementById('ikSO').value,
     shoulder_mult:+document.getElementById('ikSM').value,
-    invert_base:document.getElementById('ikIB').checked
+    invert_base:document.getElementById('ikIB').checked,
+    pick_drop_extra:+document.getElementById('ikDE').value,
+    grip_extra_close:+document.getElementById('ikGE').value
   });
 }
 function poll(){
@@ -1158,6 +1166,8 @@ api('ik').then(d=>{
   document.getElementById('ikSO').value=d.shoulder_offset;
   document.getElementById('ikSM').value=d.shoulder_mult;
   document.getElementById('ikIB').checked=d.invert_base;
+  document.getElementById('ikDE').value=d.pick_drop_extra;
+  document.getElementById('ikGE').value=d.grip_extra_close;
 }).catch(()=>{});
 setInterval(poll,600);
 setInterval(pollLogs,1200);
@@ -1257,6 +1267,8 @@ def api_ik() -> Response:
                 "shoulder_offset": cfg.ik_shoulder_offset,
                 "shoulder_mult": cfg.ik_shoulder_mult,
                 "invert_base": cfg.invert_base,
+                "pick_drop_extra": cfg.pick_drop_extra,
+                "grip_extra_close": cfg.grip_extra_close,
             }
         )
     data = request.get_json(force=True) or {}
@@ -1264,6 +1276,8 @@ def api_ik() -> Response:
     cfg.ik_shoulder_offset = float(data.get("shoulder_offset", cfg.ik_shoulder_offset))
     cfg.ik_shoulder_mult = float(data.get("shoulder_mult", cfg.ik_shoulder_mult))
     cfg.invert_base = bool(data.get("invert_base", cfg.invert_base))
+    cfg.pick_drop_extra = float(data.get("pick_drop_extra", cfg.pick_drop_extra))
+    cfg.grip_extra_close = int(data.get("grip_extra_close", cfg.grip_extra_close))
     cfg.save()
     log("IK saved", "INFO")
     return jsonify({"ok": True})
