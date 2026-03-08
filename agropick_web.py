@@ -38,7 +38,7 @@ except ImportError:
 
 load_dotenv()
 
-GOOGLE_API_KEY = "AIzaSyDrKgAHVh0w7MpwxTY6k7sJdQ6PtJu5HYE"
+GOOGLE_API_KEY = "AIzaSyDrKgAHVh0w7MpwxTY6k7sJdQ6PtJu"
 
 CONFIG_FILE = "agropick_config.json"
 
