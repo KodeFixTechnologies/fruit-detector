@@ -592,34 +592,6 @@ class TomatoVisionController:
             log(f"YOLO failed: {exc}", "ERROR")
             return False
 
-    def _color_matches_tomato(self, frame: np.ndarray, x1: int, y1: int, x2: int, y2: int, label: str) -> bool:
-        """
-        Confirm the dominant HSV color inside the bounding box looks like a tomato.
-        Ripe   → red/orange pixels  (H: 0-15 or 160-180, S>80, V>60)
-        Unripe → green/yellow pixels (H: 25-85, S>60, V>50)
-        At least 20% of the cropped pixels must match the expected color range.
-        This rejects false positives like skin, clothing, or background objects.
-        """
-        crop = frame[max(0, y1):y2, max(0, x1):x2]
-        if crop.size == 0:
-            return False
-
-        # Convert BGR→HSV (frame is already BGR from OpenCV/PiCamera)
-        hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-        total = hsv.shape[0] * hsv.shape[1]
-
-        if label.lower() == "ripe":
-            # Red wraps around 0° in HSV — need two ranges
-            mask1 = cv2.inRange(hsv, np.array([0, 80, 60]),   np.array([15, 255, 255]))
-            mask2 = cv2.inRange(hsv, np.array([160, 80, 60]), np.array([180, 255, 255]))
-            matched = cv2.countNonZero(mask1) + cv2.countNonZero(mask2)
-        else:
-            # Unripe: green/yellow
-            mask = cv2.inRange(hsv, np.array([25, 60, 50]), np.array([85, 255, 255]))
-            matched = cv2.countNonZero(mask)
-
-        return (matched / total) >= 0.20
-
     def _pixel_to_robot(self, center_x: int, center_y: int, frame_w: int, frame_h: int) -> Tuple[float, float]:
         x_norm = center_x / max(frame_w, 1)
         y_norm = center_y / max(frame_h, 1)
@@ -661,11 +633,6 @@ class TomatoVisionController:
                 # A chest/shirt/large flat object will have a very skewed ratio.
                 aspect = width / height if height > 0 else 999
                 if not (0.4 <= aspect <= 2.5):
-                    continue
-
-                # Color guard: verify the dominant color inside the box matches
-                # what a ripe (red/orange) or unripe (green/yellow) tomato looks like.
-                if not self._color_matches_tomato(frame, x1, y1, x2, y2, label):
                     continue
 
                 center_x = (x1 + x2) // 2
