@@ -38,7 +38,7 @@ except ImportError:
 
 load_dotenv()
 
-GOOGLE_API_KEY = "AIzaSyDrKgAHVh0w7MpwxTY6k7sJdQ6PtJu"
+GOOGLE_API_KEY =  os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")
 
 CONFIG_FILE = "agropick_config.json"
 
