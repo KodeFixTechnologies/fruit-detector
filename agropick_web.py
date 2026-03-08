@@ -198,9 +198,9 @@ class SerialManager:
                 self._flush_input()
                 self.ser.write(f"GET|{command_id}|VERSION\n".encode())
                 self.ser.flush()
-                deadline = time.time() + 1.0
+                deadline = time.time() + 3.0
                 while time.time() < deadline:
-                    line = self._readline(0.15)
+                    line = self._readline(0.2)
                     if not line:
                         continue
                     if line == f"ACK|{command_id}":
@@ -272,8 +272,9 @@ class SerialManager:
             self.ser = serial.Serial(port, cfg.esp_baud, timeout=1)
             time.sleep(2)
             firmware_ready = False
-            while self.ser.in_waiting:
-                line = self.ser.readline().decode("utf-8", errors="ignore").strip()
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not firmware_ready:
+                line = self._readline(0.2)
                 if line:
                     log(f"ESP32: {line}")
                     if line.startswith("READY|actuator-v1"):
