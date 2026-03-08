@@ -536,13 +536,20 @@ class ArmController:
             log("Step 6/6: Lift and home", "ARM")
             self.move_to_xyz(x, y, cfg.grab_h + cfg.lift_h)
             time.sleep(0.5)
-            # Call serial_mgr.home() directly to avoid arm.home()'s finally block
-            # prematurely setting arm.busy=False while pick() is still running.
+            # Safe return: raise shoulder first so arm lifts up before swinging base back.
+            # Avoids the sudden backward jerk caused by snapping all servos at once via HOME.
             log("Moving to HOME", "ARM")
-            serial_mgr.home()
+            self._send("shoulder", cfg.shoulder_max)
+            time.sleep(0.6)
+            serial_mgr.pose(cfg.home_base, cfg.shoulder_max, cfg.home_wrist)
+            time.sleep(0.6)
+            serial_mgr.pose(cfg.home_base, cfg.home_shoulder, cfg.home_wrist)
+            time.sleep(0.4)
+            self._send("rotgripper", cfg.home_rotgrip)
+            time.sleep(0.3)
             self.positions = {
                 "base": cfg.home_base,
-                "shoulder": max(cfg.home_shoulder, 150),
+                "shoulder": cfg.home_shoulder,
                 "wrist": cfg.home_wrist,
                 "gripper": cfg.home_gripper,
                 "rotgripper": cfg.home_rotgrip,
