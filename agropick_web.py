@@ -574,9 +574,9 @@ arm = ArmController()
 
 
 DETECT_PROMPT = """
-You are controlling a robot arm for agricultural harvesting.
-Analyze this image and detect any visible fruits or vegetables that could be
-picked.
+You are a fruit detection model on a harvesting robot.
+Detect ONLY tomatoes, chillies, and eggplants (brinjal) in the image.
+Ignore everything else — people, hands, background, pots, leaves, other objects.
 
 Return ONLY a JSON object, with no explanation and no markdown:
 {
@@ -590,18 +590,16 @@ Return ONLY a JSON object, with no explanation and no markdown:
     }
   ],
   "scene_description": "brief one line description",
-  "recommended_target": "label of best fruit or vegetable to pick, or null"
+  "recommended_target": "label of best fruit to pick, or null"
 }
 
 Rules:
-- Include fruits and vegetables such as tomato, brinjal, eggplant, okra,
-  cucumber, chili, capsicum, pepper, bean, carrot, onion, potato, banana,
-  apple, mango, orange, and similar produce when visible.
+- Only detect these three classes: tomato, chilli, eggplant.
+- Do NOT detect people, hands, clothing, pots, leaves, soil, or any other object.
 - Use normalized coordinates from 0 to 1000.
-- If nothing suitable is visible, return an empty detections list and null
-  recommended_target.
-- If ripeness is not relevant for a vegetable, set is_ripe to true when it
-  looks harvestable.
+- Set is_ripe to true if the fruit looks fully ripe and ready to harvest.
+- Set is_ripe to false if the fruit is green, unripe, or not ready.
+- If none of the three target vegetables are visible, return empty detections and null recommended_target.
 """.strip()
 
 
@@ -873,9 +871,9 @@ def trigger_detect(frame: np.ndarray) -> None:
         update_detection_state(detections, scene_desc)
         if detections:
             ripe_count = sum(1 for item in detections if item["is_ripe"])
-            log(f"Detected {len(detections)} items ({ripe_count} ripe)", "GEMINI")
+            log(f"Detected {len(detections)} items ({ripe_count} ripe)", "YOLO")
         else:
-            log("No harvestable produce visible", "GEMINI")
+            log("No harvestable produce visible", "YOLO")
     except concurrent.futures.TimeoutError:
         log(f"Gemini timeout after {cfg.gemini_timeout:.0f}s (bad network) — skipping scan", "WARN")
     except Exception as exc:
@@ -1125,7 +1123,7 @@ input[type=range]::-webkit-slider-thumb{
   <div class="logo">AGROPICK</div>
   <div class="header-status">
     <span><span class="dot" id="espDot"></span>ESP32</span>
-    <span><span class="dot" id="gemDot"></span>Gemini</span>
+    <span><span class="dot" id="gemDot"></span>YOLO</span>
     <span id="modeLabel">MANUAL</span>
   </div>
 </div>
