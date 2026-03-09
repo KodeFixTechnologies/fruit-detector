@@ -858,9 +858,7 @@ def best_pickable_detection() -> Optional[Dict[str, Any]]:
     with S.lock:
         detections = list(S.detections)
     ripe = [item for item in detections if item["is_ripe"] and item["can_grip"]]
-    if ripe:
-        return ripe[0]
-    return detections[0] if detections else None
+    return ripe[0] if ripe else None
 
 
 def trigger_detect(frame: np.ndarray) -> None:
