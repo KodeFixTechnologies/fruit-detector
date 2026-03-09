@@ -589,7 +589,6 @@ Return ONLY a JSON object, with no explanation and no markdown:
       "is_ripe": true
     }
   ],
-  "scene_description": "brief one line description",
   "recommended_target": "label of best fruit to pick, or null"
 }
 
@@ -916,7 +915,6 @@ def draw_overlay(frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndar
     cv2.rectangle(out, (0, 0), (width, 32), (20, 20, 20), -1)
     with S.lock:
         status = f"{S.mode.upper()} | Ripe:{S.ripe_count} | Picks:{S.picks_ok}/{S.picks_try}"
-        scene_desc = S.scene_desc
         esp_ok = S.esp_ok
     mode_color = {
         "manual": (150, 150, 150),
@@ -926,17 +924,6 @@ def draw_overlay(frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndar
     cv2.putText(out, status, (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, mode_color, 2)
     cv2.circle(out, (width - 20, 16), 6, (0, 255, 0) if esp_ok else (0, 0, 255), -1)
 
-    if scene_desc:
-        cv2.rectangle(out, (0, 32), (width, 50), (10, 10, 40), -1)
-        cv2.putText(
-            out,
-            scene_desc[:70],
-            (8, 46),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.4,
-            (200, 200, 255),
-            1,
-        )
 
     return out
 
@@ -1140,6 +1127,7 @@ input[type=range]::-webkit-slider-thumb{
         <button class="btn btn-go" id="startBtn" onclick="toggleSys()">START</button>
         <button class="btn btn-home" onclick="api('arm/home')">HOME</button>
         <button class="btn btn-home" onclick="api('scan')">SCAN</button>
+        <button class="btn btn-home" onclick="takeScreenshot()">&#128247;</button>
       </div>
       <h3>Rover</h3>
       <div class="rover-pad">
@@ -1224,6 +1212,12 @@ function toggleSys(){
   const btn=document.getElementById('startBtn');
   btn.textContent=running?'STOP':'START';
   btn.className='btn '+(running?'btn-stop':'btn-go');
+}
+function takeScreenshot(){
+  const a=document.createElement('a');
+  a.href='/api/screenshot';
+  a.download='';
+  a.click();
 }
 function setSpeed(v){
   document.getElementById('spdVal').textContent=v;
@@ -1402,6 +1396,20 @@ def api_scan() -> Response:
 def api_camera_color() -> Response:
     camera.toggle_color_swap()
     return jsonify({"ok": True})
+
+
+@app.route("/api/screenshot")
+def api_screenshot() -> Response:
+    with S.lock:
+        frame = S.last_jpeg
+    if not frame:
+        return jsonify({"ok": False}), 404
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    return Response(
+        frame,
+        mimetype="image/jpeg",
+        headers={"Content-Disposition": f"attachment; filename=agropick_{ts}.jpg"},
+    )
 
 
 @app.route("/api/rover/<cmd>")
