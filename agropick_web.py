@@ -893,7 +893,9 @@ def draw_overlay(frame: np.ndarray, detections: List[Dict[str, Any]]) -> np.ndar
             if not det["can_grip"]:
                 color = (0, 100, 255)
             cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
-            text = f"{det['label']} {det['diameter_cm']:.1f}cm"
+            ripeness = "Ripe" if det["is_ripe"] else "Unripe"
+            label = det["label"].replace("_", " ").title()
+            text = f"{label} | {ripeness} | {det['diameter_cm']:.1f}cm"
             (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
             cv2.rectangle(out, (x1, max(0, y1 - th - 8)), (x1 + tw + 4, y1), color, -1)
             cv2.putText(
@@ -1102,6 +1104,7 @@ input[type=range]::-webkit-slider-thumb{
 }
 .log-line{border-bottom:1px solid var(--border);padding:2px 0}
 </style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
 </head>
 <body>
 <div class="header">
@@ -1214,10 +1217,13 @@ function toggleSys(){
   btn.className='btn '+(running?'btn-stop':'btn-go');
 }
 function takeScreenshot(){
-  const a=document.createElement('a');
-  a.href='/api/screenshot';
-  a.download='';
-  a.click();
+  const ts=new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
+  html2canvas(document.body,{useCORS:true,allowTaint:true}).then(canvas=>{
+    const a=document.createElement('a');
+    a.href=canvas.toDataURL('image/png');
+    a.download='agropick_'+ts+'.png';
+    a.click();
+  });
 }
 function setSpeed(v){
   document.getElementById('spdVal').textContent=v;
