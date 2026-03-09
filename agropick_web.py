@@ -492,6 +492,159 @@ class ArmController:
         finally:
             self._set_busy(False)
 
+    def agent_pick(self, x: float, y: float, diameter_cm: float = 5.0) -> bool:
+        """Gemini-guided pick — checks alignment and grip at each step."""
+        log(f"AGENT PICK at ({x:.1f},{y:.1f}) diameter {diameter_cm:.1f}cm", "PICK")
+        self._set_busy(True)
+        with S.lock:
+            S.picks_try += 1
+        try:
+            # Step 1: Approach high
+            log("Step 1: Approach high", "ARM")
+            self.move_to_xyz(x, y, cfg.grab_h + cfg.approach_h)
+            time.sleep(0.6)
+
+            # Step 2: Open gripper
+            log("Step 2: Open gripper", "ARM")
+            self._send("gripper", cfg.gripper_min)
+            time.sleep(0.4)
+
+            # Step 3: Gemini alignment check — adjust base/shoulder if needed
+            log("Step 3: Alignment check", "AGENT")
+            for attempt in range(3):
+                fresh = camera.capture_frame()
+                if fresh is None:
+                    break
+                assessment = gemini.assess_alignment(
+                    camera.frame_to_jpeg(fresh), self.positions
+                )
+                status = assessment.get("status", "aligned")
+                reason = assessment.get("reason", "")
+                log(f"Alignment [{attempt+1}]: {status} — {reason}", "AGENT")
+
+                if status == "no_fruit":
+                    log("Fruit lost — aborting pick", "WARN")
+                    self.home()
+                    return False
+
+                if status == "aligned":
+                    break
+
+                # Apply small correction — if base is already at limit, nudge rover instead
+                base_adj = int(np.clip(assessment.get("base_adjust", 0), -12, 12))
+                shoulder_adj = int(np.clip(assessment.get("shoulder_adjust", 0), -8, 8))
+
+                if base_adj != 0:
+                    current_base = self.positions["base"]
+                    desired_base = current_base + base_adj
+                    if desired_base < cfg.base_min:
+                        # Base can't go further left — nudge rover left instead
+                        log(f"Base at min ({cfg.base_min}), rover-left nudge instead", "AGENT")
+                        rover.left(cfg.rover_turn_speed)
+                        time.sleep(0.2)
+                        rover.stop()
+                        base_adj = 0
+                    elif desired_base > cfg.base_max:
+                        # Base can't go further right — nudge rover right instead
+                        log(f"Base at max ({cfg.base_max}), rover-right nudge instead", "AGENT")
+                        rover.right(cfg.rover_turn_speed)
+                        time.sleep(0.2)
+                        rover.stop()
+                        base_adj = 0
+
+                new_base = int(np.clip(self.positions["base"] + base_adj, cfg.base_min, cfg.base_max))
+                new_shoulder = int(np.clip(self.positions["shoulder"] + shoulder_adj, cfg.shoulder_min, cfg.shoulder_max))
+                log(f"Adjusting base {self.positions['base']}→{new_base}, shoulder {self.positions['shoulder']}→{new_shoulder}", "AGENT")
+                serial_mgr.pose(new_base, new_shoulder, cfg.wrist_fixed)
+                self.positions.update(base=new_base, shoulder=new_shoulder)
+                with S.lock:
+                    S.arm_pos = self.positions.copy()
+                time.sleep(0.5)
+
+            # Step 4: Lower to target
+            log("Step 4: Lower to target", "ARM")
+            self.move_to_xyz(x, y, cfg.grab_h - cfg.pick_drop_extra)
+            time.sleep(0.6)
+
+            # Step 5: Grip
+            log("Step 5: Grip", "ARM")
+            angle_range = cfg.gripper_max - cfg.gripper_min
+            grip_angle = cfg.gripper_min + int((1 - min(diameter_cm, 8.0) / 8.0) * angle_range)
+            grip_angle = int(np.clip(grip_angle + cfg.grip_extra_close, cfg.gripper_min, cfg.gripper_max))
+            self._send("gripper", grip_angle)
+            time.sleep(0.6)
+
+            # Step 6: Gemini grip verification (up to 2 retries)
+            log("Step 6: Grip verification", "AGENT")
+            grip_confirmed = False
+            for attempt in range(2):
+                fresh = camera.capture_frame()
+                if fresh is None:
+                    grip_confirmed = True
+                    break
+                result = gemini.assess_grip(camera.frame_to_jpeg(fresh))
+                status = result.get("status", "grip_ok")
+                log(f"Grip check [{attempt+1}]: {status} — {result.get('reason','')}", "AGENT")
+                if status == "grip_ok":
+                    grip_confirmed = True
+                    break
+                # Retry: open, drop slightly lower, close again
+                log("Grip failed — retrying with extra drop", "AGENT")
+                self._send("gripper", cfg.gripper_min)
+                time.sleep(0.3)
+                self.move_to_xyz(x, y, cfg.grab_h - cfg.pick_drop_extra - 1.0)
+                time.sleep(0.4)
+                self._send("gripper", grip_angle)
+                time.sleep(0.6)
+
+            # Step 7: Twist
+            log("Step 7: Twist", "ARM")
+            home_rot = cfg.home_rotgrip
+            for _ in range(cfg.twist_cycles):
+                self._send("rotgripper", home_rot + cfg.twist_angle)
+                time.sleep(cfg.twist_delay)
+                self._send("rotgripper", home_rot - cfg.twist_angle)
+                time.sleep(cfg.twist_delay)
+            self._send("rotgripper", home_rot)
+            time.sleep(0.4)
+
+            # Step 8: Lift and home
+            log("Step 8: Lift and home", "ARM")
+            self.move_to_xyz(x, y, cfg.grab_h + cfg.lift_h)
+            time.sleep(0.5)
+            self._send("shoulder", cfg.shoulder_max)
+            time.sleep(0.6)
+            serial_mgr.pose(cfg.home_base, cfg.shoulder_max, cfg.home_wrist)
+            time.sleep(0.6)
+            serial_mgr.pose(cfg.home_base, cfg.home_shoulder, cfg.home_wrist)
+            time.sleep(0.4)
+            self._send("rotgripper", cfg.home_rotgrip)
+            time.sleep(0.3)
+            self.positions = {
+                "base": cfg.home_base,
+                "shoulder": cfg.home_shoulder,
+                "wrist": cfg.home_wrist,
+                "gripper": cfg.home_gripper,
+                "rotgripper": cfg.home_rotgrip,
+            }
+            with S.lock:
+                S.arm_pos = self.positions.copy()
+            self._send("gripper", cfg.gripper_min)
+
+            with S.lock:
+                S.picks_ok += 1 if grip_confirmed else 0
+                S.picks_try += 0
+                S.detections = []
+                S.ripe_count = 0
+                S.unripe_count = 0
+            log("AGENT PICK COMPLETE" if grip_confirmed else "AGENT PICK — grip unconfirmed", "SUCCESS")
+            return grip_confirmed
+        except Exception as exc:
+            log(f"Agent pick failed: {exc}", "ERROR")
+            return False
+        finally:
+            self._set_busy(False)
+
     def pick(self, x: float, y: float, diameter_cm: float = 5.0) -> bool:
         log(f"PICK at ({x:.1f},{y:.1f}) diameter {diameter_cm:.1f}cm", "PICK")
         self._set_busy(True)
@@ -599,6 +752,105 @@ Rules:
 - Set is_ripe to true if the fruit looks fully ripe and ready to harvest.
 - Set is_ripe to false if the fruit is green, unripe, or not ready.
 - If none of the three target vegetables are visible, return empty detections and null recommended_target.
+""".strip()
+
+
+AGENT_PROMPT = """
+You are the AI brain of a harvesting robot with a wheeled rover and a robot arm.
+Analyze the camera image and decide exactly ONE action to take right now.
+
+Target fruits: ripe tomato, ripe chilli, ripe eggplant ONLY. Ignore everything else.
+
+Robot arm hardware limits (firmware enforced):
+  base servo:     70° to 160° (center 110°) — left/right reach
+  shoulder servo: 120° to 160° — up/down reach (very limited range)
+  gripper:        30° (open) to 90° (closed)
+The arm will do fine alignment automatically once pick is triggered.
+If the arm cannot reach, the system will nudge the rover to compensate.
+
+Available actions:
+  rover_forward  — move forward to search / close distance
+  rover_back     — move backward
+  rover_left     — turn left to center a fruit seen on the left side
+  rover_right    — turn right to center a fruit seen on the right side
+  pick           — stop and pick (only when a ripe fruit is clearly visible and centered)
+  wait           — do nothing (use if unsure)
+
+Return ONLY this JSON, no explanation, no markdown:
+{
+  "action": "rover_forward",
+  "duration": 0.5,
+  "pick_point": [y, x],
+  "diameter_cm": 5.0,
+  "reason": "one line"
+}
+
+Rules:
+- "pick_point" and "diameter_cm" are required ONLY for action "pick", omit otherwise.
+- "duration" in seconds (0.2 to 0.8) is required for all rover actions, omit for pick/wait.
+- Use "pick" ONLY when the ripe fruit is roughly centered (within middle 40% of frame width).
+- If fruit is visible but off-center, use rover_left or rover_right to center it first.
+- If fruit is partially cut off at the frame edge, move the rover toward that side.
+- If no ripe fruit is visible, use rover_forward to keep searching.
+- Use normalized pick_point coordinates from 0 to 1000.
+""".strip()
+
+
+PICK_ALIGN_PROMPT = """
+You are guiding a robot arm to align its gripper with a fruit before picking.
+The camera is mounted on the arm wrist — what you see is what the gripper sees.
+Current arm state is provided in the prompt context.
+
+Hardware limits (firmware enforced):
+  base servo:     70° to 160° (center ~110°)
+  shoulder servo: 120° to 160°
+  gripper servo:  30° to 90°
+
+If the current base is near its min (<=75) or max (>=155), the system will
+automatically nudge the rover instead of the base servo when adjusting left/right.
+You do not need to handle this — just provide the desired adjustment direction.
+
+Look at the image and decide if the gripper is aligned with the ripe fruit.
+
+Return ONLY this JSON:
+{
+  "status": "aligned",
+  "base_adjust": 0,
+  "shoulder_adjust": 0,
+  "reason": "one line"
+}
+
+status values:
+  "aligned"     — fruit is centered and gripper looks ready to grip, proceed
+  "adjust"      — fruit visible but gripper needs small correction
+  "no_fruit"    — fruit not visible in frame, abort
+
+base_adjust: degrees to rotate base left(-) or right(+), range -12 to +12
+shoulder_adjust: degrees to raise(-) or lower(+) shoulder, range -8 to +8
+
+Rules:
+- Only use "aligned" if the ripe fruit is clearly centered in frame and close.
+- Keep adjustments small (2-8 degrees). Do not over-correct.
+- If fruit is not visible at all, return "no_fruit".
+""".strip()
+
+
+PICK_GRIP_PROMPT = """
+The robot gripper has just closed around a fruit. You are confirming whether the grip succeeded.
+The camera is mounted on the wrist — look at whether the fruit is now held between the gripper fingers.
+
+Gripper servo range: 30° (fully open) to 90° (fully closed). A grip angle around 50-80° means
+the gripper tried to close around the fruit.
+
+Return ONLY this JSON:
+{
+  "status": "grip_ok",
+  "reason": "one line"
+}
+
+status values:
+  "grip_ok"     — fruit appears to be held in the gripper (fingers around it, fruit not visible below)
+  "grip_failed" — fruit is not in the gripper (fingers closed on air, fruit still hanging free)
 """.strip()
 
 
@@ -764,6 +1016,38 @@ class GeminiController:
             )
         )
         return detections, result["scene_description"]
+
+    def assess_alignment(self, image_bytes: bytes, arm_state: Dict[str, Any]) -> Dict[str, Any]:
+        prompt = f"Arm state: base={arm_state['base']}° shoulder={arm_state['shoulder']}°\n\n{PICK_ALIGN_PROMPT}"
+        try:
+            raw = parse_json_safe(self._call_with_timeout(image_bytes, prompt))
+            if isinstance(raw, dict) and raw.get("status") in ("aligned", "adjust", "no_fruit"):
+                return raw
+        except Exception as exc:
+            log(f"Alignment check failed: {exc}", "WARN")
+        return {"status": "aligned", "base_adjust": 0, "shoulder_adjust": 0, "reason": "fallback"}
+
+    def assess_grip(self, image_bytes: bytes) -> Dict[str, Any]:
+        try:
+            raw = parse_json_safe(self._call_with_timeout(image_bytes, PICK_GRIP_PROMPT))
+            if isinstance(raw, dict) and raw.get("status") in ("grip_ok", "grip_failed"):
+                return raw
+        except Exception as exc:
+            log(f"Grip check failed: {exc}", "WARN")
+        return {"status": "grip_ok", "reason": "fallback"}
+
+    def decide(self, image_bytes: bytes) -> Optional[Dict[str, Any]]:
+        try:
+            raw = parse_json_safe(self._call_with_timeout(image_bytes, AGENT_PROMPT))
+            if not isinstance(raw, dict):
+                return None
+            action = raw.get("action", "wait")
+            if action not in ("rover_forward", "rover_back", "rover_left", "rover_right", "pick", "wait"):
+                return None
+            return raw
+        except Exception as exc:
+            log(f"Agent decision failed: {exc}", "WARN")
+            return None
 
 
 gemini = GeminiController()
@@ -954,7 +1238,7 @@ def control_loop() -> None:
                 S.running
                 and S.gemini_ok
                 and not S.arm_busy
-                and S.mode != "autonomous"
+                and S.mode not in ("autonomous", "agent")
                 and (now - last_detect) >= cfg.detect_interval
             )
             detections = list(S.detections)
@@ -1004,6 +1288,43 @@ def control_loop() -> None:
                 # Rover is stopped and no in-range fruit — start the next step.
                 rover.forward(cfg.auto_rover_speed)
                 scan_step_start = time.time()
+
+        elif S.mode == "agent" and S.running and not arm.busy:
+            rover.stop()
+            time.sleep(cfg.scan_settle_time)
+            fresh = camera.capture_frame()
+            if fresh is not None:
+                decision = gemini.decide(camera.frame_to_jpeg(fresh))
+                if decision:
+                    action = decision.get("action", "wait")
+                    reason = decision.get("reason", "")
+                    log(f"AI Agent: {action} — {reason}", "AGENT")
+                    dur = float(decision.get("duration", 0.5))
+                    dur = max(0.2, min(0.8, dur))
+                    if action == "rover_forward":
+                        rover.forward(cfg.auto_rover_speed)
+                        time.sleep(dur)
+                        rover.stop()
+                    elif action == "rover_back":
+                        rover.backward(cfg.auto_rover_speed)
+                        time.sleep(dur)
+                        rover.stop()
+                    elif action == "rover_left":
+                        rover.left(cfg.rover_turn_speed)
+                        time.sleep(dur)
+                        rover.stop()
+                    elif action == "rover_right":
+                        rover.right(cfg.rover_turn_speed)
+                        time.sleep(dur)
+                        rover.stop()
+                    elif action == "pick":
+                        point = decision.get("pick_point", [500, 500])
+                        if isinstance(point, list) and len(point) == 2:
+                            x_cm, y_cm = gemini._norm_to_cm(
+                                clamp_norm(point[1]), clamp_norm(point[0])
+                            )
+                            diam = float(decision.get("diameter_cm", 5.0))
+                            arm.agent_pick(x_cm, y_cm, diam)
 
         elif S.mode == "semi-auto" and S.running and not arm.busy:
             det = best_pickable_detection()
@@ -1125,6 +1446,7 @@ input[type=range]::-webkit-slider-thumb{
         <button class="mode-btn active" data-mode="manual" onclick="setMode('manual',this)">Manual</button>
         <button class="mode-btn" data-mode="semi-auto" onclick="setMode('semi-auto',this)">Semi-Auto</button>
         <button class="mode-btn" data-mode="autonomous" onclick="setMode('autonomous',this)">Autonomous</button>
+        <button class="mode-btn" data-mode="agent" onclick="setMode('agent',this)">AI Agent</button>
       </div>
       <div class="ctrl-row">
         <button class="btn btn-go" id="startBtn" onclick="toggleSys()">START</button>
