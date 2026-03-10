@@ -1445,8 +1445,8 @@ input[type=range]::-webkit-slider-thumb{
       <div class="modes">
         <button class="mode-btn active" data-mode="manual" onclick="setMode('manual',this)">Manual</button>
         <button class="mode-btn" data-mode="semi-auto" onclick="setMode('semi-auto',this)">Semi-Auto</button>
-        <button class="mode-btn" data-mode="autonomous" onclick="setMode('autonomous',this)">Autonomous</button>
-        <button class="mode-btn" data-mode="agent" onclick="setMode('agent',this)">AI Agent</button>
+        <button class="mode-btn" id="autoToggleBtn" data-mode="autonomous" onclick="toggleAutonomous(this)">Autonomous</button>
+        <button class="mode-btn" data-mode="agent" onclick="setMode('agent',this)">Autonomous</button>
       </div>
       <div class="ctrl-row">
         <button class="btn btn-go" id="startBtn" onclick="toggleSys()">START</button>
@@ -1530,6 +1530,20 @@ function setMode(mode,el){
   document.querySelectorAll('.mode-btn').forEach(btn=>btn.classList.remove('active'));
   el.classList.add('active');
   document.getElementById('modeLabel').textContent=mode.toUpperCase();
+}
+function toggleAutonomous(el){
+  const isActive=el.classList.contains('active');
+  if(isActive){
+    api('mode',{mode:'manual'});
+    document.querySelectorAll('.mode-btn').forEach(btn=>btn.classList.remove('active'));
+    document.querySelector('.mode-btn[data-mode="manual"]').classList.add('active');
+    document.getElementById('modeLabel').textContent='MANUAL';
+  } else {
+    api('mode',{mode:'autonomous'});
+    document.querySelectorAll('.mode-btn').forEach(btn=>btn.classList.remove('active'));
+    el.classList.add('active');
+    document.getElementById('modeLabel').textContent='AUTONOMOUS';
+  }
 }
 function toggleSys(){
   running=!running;
